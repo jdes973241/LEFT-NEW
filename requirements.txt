@@ -1,0 +1,8 @@
+streamlit>=1.32.0
+yfinance>=0.2.40
+pandas>=2.0.0
+numpy>=1.24.0
+altair>=5.0.0
+arch>=6.3.0
+pytz>=2023.3
+scipy>=1.10.0
