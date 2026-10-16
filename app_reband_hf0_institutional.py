@@ -1,7 +1,4 @@
-import json
-from collections import defaultdict
 from datetime import datetime
-from pathlib import Path
 import warnings
 
 import altair as alt
@@ -108,8 +105,21 @@ with st.sidebar:
 
 
 # ==========================================
-# 2. 數據下載 (同時抓取 Open 與 Close 以精確模擬隔夜與日內漂移)
+# 2. 數據下載與防呆工具函式 (相容 Python 3.14 / Pandas 2.2+ / 3.0)
 # ==========================================
+def safe_row_idxmax(df: pd.DataFrame, default_col: str) -> pd.Series:
+    """在任何 Pandas 版本下安全取得每列最大值欄位名稱（遇全 NaN 列自動回傳 default_col，絕不拋出 ValueError）。"""
+    if df.empty:
+        return pd.Series(dtype=object)
+    arr = np.nan_to_num(df.to_numpy(dtype=float), nan=-np.inf)
+    all_missing = np.all(arr == -np.inf, axis=1)
+    max_idx = np.argmax(arr, axis=1)
+    cols = np.asarray(df.columns, dtype=object)
+    chosen = cols[max_idx].copy()
+    chosen[all_missing] = default_col
+    return pd.Series(chosen, index=df.index, dtype=object)
+
+
 def get_monthly_data(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -117,7 +127,7 @@ def get_monthly_data(df: pd.DataFrame) -> pd.DataFrame:
         df.index = pd.to_datetime(df.index)
     period_idx = df.index.to_period("M")
     month_end_dates = df.index.to_series().groupby(period_idx).max()
-    return df.loc[month_end_dates]
+    return df.loc[month_end_dates.values]
 
 
 @st.cache_data(ttl=300, show_spinner="正在從 Yahoo Finance 下載最新全球 ETF 報價...")
@@ -137,20 +147,38 @@ def get_live_market_bundle():
             return pd.DataFrame(), pd.DataFrame()
         closes = pd.DataFrame(index=raw.index)
         opens = pd.DataFrame(index=raw.index)
-        for t in tickers:
-            if t in raw.columns:
-                t_df = raw[t]
-                if "Close" in t_df.columns:
-                    closes[t] = t_df["Close"]
-                elif "Price" in t_df.columns:
-                    closes[t] = t_df["Price"]
-                if "Open" in t_df.columns:
-                    opens[t] = t_df["Open"]
-                elif t in closes.columns:
+
+        if isinstance(raw.columns, pd.MultiIndex):
+            lvl0 = set(raw.columns.get_level_values(0))
+            lvl1 = set(raw.columns.get_level_values(1))
+            for t in tickers:
+                if t in lvl0:
+                    t_df = raw[t]
+                    if "Close" in t_df.columns:
+                        closes[t] = pd.to_numeric(t_df["Close"], errors="coerce")
+                    elif "Price" in t_df.columns:
+                        closes[t] = pd.to_numeric(t_df["Price"], errors="coerce")
+                    if "Open" in t_df.columns:
+                        opens[t] = pd.to_numeric(t_df["Open"], errors="coerce")
+                    elif t in closes.columns:
+                        opens[t] = closes[t]
+                elif t in lvl1:
+                    if ("Close", t) in raw.columns:
+                        closes[t] = pd.to_numeric(raw[("Close", t)], errors="coerce")
+                    if ("Open", t) in raw.columns:
+                        opens[t] = pd.to_numeric(raw[("Open", t)], errors="coerce")
+                    elif t in closes.columns:
+                        opens[t] = closes[t]
+        else:
+            for t in tickers:
+                if t in raw.columns:
+                    closes[t] = pd.to_numeric(raw[t], errors="coerce")
                     opens[t] = closes[t]
+
         if closes.index.tz is not None:
             closes.index = closes.index.tz_localize(None)
             opens.index = opens.index.tz_localize(None)
+
         closes = closes.ffill()
         opens = opens.ffill()
         return closes, opens
@@ -166,7 +194,8 @@ def calculate_monthly_signals_1x(closes: pd.DataFrame):
     """嚴格使用 1x 原型 ETF (SPY, VGK, EEM) 計算全歷史與當月動能、SMA6 與 GLD/TLT 防禦選擇。"""
     prices_1x = closes[PROTO_ETFS_1X].dropna(how="all")
     monthly_1x = get_monthly_data(prices_1x)
-    daily_vol_252 = prices_1x.pct_change().rolling(252).std(ddof=1) * np.sqrt(252.0)
+    ret_1x_daily = (prices_1x / prices_1x.shift(1)) - 1.0
+    daily_vol_252 = ret_1x_daily.rolling(252).std(ddof=1) * np.sqrt(252.0)
     monthly_vol_252 = daily_vol_252.reindex(monthly_1x.index)
 
     # 1. 非重疊三段動能 (0,3], (3,7], (7,12]
@@ -229,18 +258,26 @@ def calculate_monthly_signals_1x(closes: pd.DataFrame):
         "Ret_12M": [float(safe_ret12.loc[ref_date, t]) for t in SAFE_POOL],
         "Comp_Ret": [float(safe_comp.loc[ref_date, t]) for t in SAFE_POOL],
     }).set_index("Ticker")
-    safe_win = safe_df["Comp_Ret"].idxmax()
+    comp_arr = np.nan_to_num(safe_df["Comp_Ret"].to_numpy(dtype=float), nan=-np.inf)
+    safe_win = str(safe_df.index[int(np.argmax(comp_arr))])
 
-    # 建立日頻對齊的月度訊號序列 (供 5 相位 200/175 狀態機回放使用)
-    # 若未勾選 FORCE_EOM，當月尚未結束的那筆月底列不生效於當月日頻序列
-    effective_monthly_idx = monthly_1x.index if (FORCE_EOM or last_data_period < current_tw_period) else monthly_1x.index[:-1]
-    leader_1x_monthly = total_score_df.loc[effective_monthly_idx].idxmax(axis=1)
+    # 建立日頻對齊的月度訊號序列 (使用 safe_row_idxmax 避免早期前 12 個月全 NaN 觸發 ValueError)
+    effective_monthly_idx = (
+        monthly_1x.index if (FORCE_EOM or last_data_period < current_tw_period) else monthly_1x.index[:-1]
+    )
+    leader_1x_monthly = safe_row_idxmax(total_score_df.loc[effective_monthly_idx], default_col="SPY")
     leader_3x_monthly = leader_1x_monthly.map(REVERSE_MAPPING)
-    safe_win_monthly = safe_comp.loc[effective_monthly_idx].idxmax(axis=1)
+    safe_win_monthly = safe_row_idxmax(safe_comp.loc[effective_monthly_idx], default_col="GLD")
 
-    daily_leader_3x = leader_3x_monthly.reindex(closes.index).ffill()
-    daily_safe_win = safe_win_monthly.reindex(closes.index).ffill()
-    daily_sma6_by_3x = sma6_state_df.loc[effective_monthly_idx].rename(columns=REVERSE_MAPPING).reindex(closes.index).ffill()
+    daily_leader_3x = leader_3x_monthly.reindex(closes.index).ffill().fillna("UPRO")
+    daily_safe_win = safe_win_monthly.reindex(closes.index).ffill().fillna("GLD")
+    daily_sma6_by_3x = (
+        sma6_state_df.loc[effective_monthly_idx]
+        .rename(columns=REVERSE_MAPPING)
+        .reindex(closes.index)
+        .ffill()
+        .fillna(1.0)
+    )
 
     return {
         "ref_date": ref_date,
@@ -297,26 +334,25 @@ def run_q_state_machine_1d(vol_arr: np.ndarray, med_arr: np.ndarray) -> tuple[np
 
 @st.cache_data(ttl=600, show_spinner="正在執行 5 相位 Student-t GARCH(1,1) 與 REBAND 200/175 狀態自動回放...")
 def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, force_eom_flag: bool):
-    """自動回放近期 5 相位 (Phase 0..4) 的 GARCH、Q、a 與 200/175 bps 實際持倉漂移狀態，
-    讓使用者打開網頁時無需手記昨日 5 相位權重，系統即自動算出今日開盤每個相位的 Action (0/1/2)！
-    """
+    """自動回放近期 5 相位 (Phase 0..4) 的 GARCH、Q、a 與 200/175 bps 實際持倉漂移狀態。"""
     m_sig = calculate_monthly_signals_1x(closes)
-    # 取最近 900 個交易日進行 GARCH 504d 滾動擬合 + 252d 中位數 + 近 140 日 REBAND 狀態精確回放
     tail_n = GARCH_WINDOW + QUANTILE_WINDOW + 140
     sub_closes = closes.tail(tail_n).copy()
     sub_opens = opens.reindex(sub_closes.index).copy()
     abs_indices = closes.index.get_indexer(sub_closes.index)
     dates_sub = sub_closes.index
 
-    # 對 3 檔 1x 原型 (SPY, VGK, EEM) 計算 5 相位 GARCH 預測波動率
     vol_5ph = {t3x: np.full((PHASE_COUNT, len(dates_sub)), np.nan) for t3x in TRADE_ETFS_3X}
     q_5ph = {t3x: np.ones((PHASE_COUNT, len(dates_sub)), dtype=float) for t3x in TRADE_ETFS_3X}
     a_5ph = {t3x: np.ones((PHASE_COUNT, len(dates_sub)), dtype=float) for t3x in TRADE_ETFS_3X}
     med_5ph = {t3x: np.full((PHASE_COUNT, len(dates_sub)), np.nan) for t3x in TRADE_ETFS_3X}
     g_o_5ph = {t3x: np.ones((PHASE_COUNT, len(dates_sub)), dtype=float) for t3x in TRADE_ETFS_3X}
 
+    active_3x_set = set(m_sig["daily_leader_3x"].tail(130).unique()) | {str(m_sig["sel_df"].index[0])}
     for t3x, proto_1x in MAPPING.items():
-        ret_pct = closes[proto_1x].pct_change() * 100.0
+        if t3x not in active_3x_set:
+            continue
+        ret_pct = ((closes[proto_1x] / closes[proto_1x].shift(1)) - 1.0) * 100.0
         ret_sub = ret_pct.reindex(dates_sub).to_numpy(dtype=float)
         last_vol = [np.nan] * PHASE_COUNT
         for idx_t in range(GARCH_WINDOW, len(dates_sub)):
@@ -336,7 +372,7 @@ def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, for
                 vol_5ph[t3x][ph, idx_t] = last_vol[ph]
 
         for ph in range(PHASE_COUNT):
-            s_v = pd.Series(vol_5ph[t3x][ph], index=dates_sub).ffill()
+            s_v = pd.Series(vol_5ph[t3x][ph], index=dates_sub).ffill().bfill()
             s_med = s_v.rolling(QUANTILE_WINDOW, min_periods=60).median().shift(1)
             s_q975 = s_v.rolling(QUANTILE_WINDOW, min_periods=60).quantile(O_EXIT_Q).shift(1)
             s_q900 = s_v.rolling(QUANTILE_WINDOW, min_periods=60).quantile(O_ENTRY_Q).shift(1)
@@ -357,13 +393,10 @@ def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, for
                         g_state = 1.0
                 g_o_5ph[t3x][ph, k_i] = g_state
 
-    # 從最後 120 個交易日起，自動回放 5 相位的 REBAND 200/175 實際持倉漂移至最新收盤日
     replay_start = max(GARCH_WINDOW + QUANTILE_WINDOW, len(dates_sub) - 120)
-    r_on_df = (sub_opens[ALL_EXEC_ASSETS] / sub_closes[ALL_EXEC_ASSETS].shift(1)) - 1.0
-    r_id_df = (sub_closes[ALL_EXEC_ASSETS] / sub_opens[ALL_EXEC_ASSETS]) - 1.0
+    r_on_df = ((sub_opens[ALL_EXEC_ASSETS] / sub_closes[ALL_EXEC_ASSETS].shift(1)) - 1.0).fillna(0.0)
+    r_id_df = ((sub_closes[ALL_EXEC_ASSETS] / sub_opens[ALL_EXEC_ASSETS]) - 1.0).fillna(0.0)
 
-    # 我們要算出：「截至最新一個收盤日 t_last 收盤後，每個相位 p 的收盤實際持倉權重 prior_close_w[p]」
-    # 以及「根據最新收盤日 t_last 訊號，在『下一個開盤日 t_next』每個相位 p 的 Base Target、Action 與 Planned Weight」！
     phase_latest_records = []
     for ph in range(PHASE_COUNT):
         holdings = {k: 0.0 for k in ALL_EXEC_ASSETS}
@@ -374,14 +407,23 @@ def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, for
         prev_base_w = None
         prev_b = None
 
-        # 先回放歷史交易日 (t_sig = idx - 1 決定 idx 開盤動作，收盤後漂移成 holdings)
         for idx in range(replay_start, len(dates_sub)):
             sig_dt = dates_sub[idx - 1]
             lead_3x = str(m_sig["daily_leader_3x"].loc[sig_dt])
+            if lead_3x not in TRADE_ETFS_3X:
+                lead_3x = "UPRO"
             safe_1x = str(m_sig["daily_safe_win"].loc[sig_dt])
+            if safe_1x not in SAFE_POOL:
+                safe_1x = "GLD"
             s_val = float(m_sig["daily_sma6_by_3x"].loc[sig_dt, lead_3x])
+            if not np.isfinite(s_val):
+                s_val = 1.0
             q_val = float(q_5ph[lead_3x][ph, idx - 1])
+            if not np.isfinite(q_val):
+                q_val = 1.0
             a_val = float(a_5ph[lead_3x][ph, idx - 1])
+            if not np.isfinite(a_val):
+                a_val = 1.0
             b_val = q_val * (0.5 * s_val + 0.5 * a_val)
 
             base_w = {k: 0.0 for k in ALL_EXEC_ASSETS}
@@ -410,7 +452,6 @@ def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, for
             else:
                 plan_w = dict(holdings)
 
-            # 模擬 idx 當日實際價格漂移 (開盤若有交易則以 plan_w 進入日內；若 Skip 則經歷隔夜+日內完整日報酬漂移)
             if mand or d_max >= BAND_TRIG_TH:
                 end_vals = {k: plan_w[k] * (1.0 + float(r_id_df.iloc[idx][k])) for k in ALL_EXEC_ASSETS}
             else:
@@ -425,10 +466,9 @@ def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, for
                 lead_3x, s_val, q_val, safe_1x, dict(base_w), b_val
             )
 
-        # 現在來到「最新收盤日 idx_now = len(dates_sub) - 1」：計算「下一個交易日開盤」的決策！
         idx_now = len(dates_sub) - 1
-        winner_now = m_sig["sel_df"].index[0]
-        safe_now = m_sig["safe_win"]
+        winner_now = str(m_sig["sel_df"].index[0])
+        safe_now = str(m_sig["safe_win"])
         s_now = float(m_sig["sel_df"].loc[winner_now, "SMA6_State"])
         q_now = float(q_5ph[winner_now][ph, idx_now])
         a_now = float(a_5ph[winner_now][ph, idx_now])
@@ -475,9 +515,9 @@ def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, for
             "Phase": ph,
             "Trade_ETF_3x": winner_now,
             "Safe_ETF_1x": safe_now,
-            "Sigma_Ann_Pct": round(sig_now, 2),
-            "Med252_Pct": round(med_now, 2),
-            "Rho_Ratio": round(rho_now, 3),
+            "Sigma_Ann_Pct": round(sig_now, 2) if np.isfinite(sig_now) else np.nan,
+            "Med252_Pct": round(med_now, 2) if np.isfinite(med_now) else np.nan,
+            "Rho_Ratio": round(rho_now, 3) if np.isfinite(rho_now) else np.nan,
             "Q_Gate": int(q_now),
             "SMA6": int(s_now),
             "a_Scalar": round(a_now, 4),
@@ -511,8 +551,8 @@ if not closes_df.empty:
     sel_df = m_sig["sel_df"]
     safe_df = m_sig["safe_df"]
     ref_date = m_sig["ref_date"]
-    winner_3x = sel_df.index[0]
-    safe_win = m_sig["safe_win"]
+    winner_3x = str(sel_df.index[0])
+    safe_win = str(m_sig["safe_win"])
 
     avg_base_stock = float(np.mean([r["Base_Stock_Weight"] for r in phase_records]))
     avg_o_stock = float(np.mean([r["O_Stock_Weight"] for r in phase_records]))
@@ -537,7 +577,6 @@ if not closes_df.empty:
 
     st.divider()
 
-    # 計算五相位匯總後的「昨日收盤權重」與「今日開盤計畫權重」
     agg_prior_w = {k: float(np.mean([r["Prior_Close_Weights"][k] for r in phase_records])) for k in ALL_EXEC_ASSETS}
     agg_base_w = {k: float(np.mean([r["Base_Target_Weights"][k] for r in phase_records])) for k in ALL_EXEC_ASSETS}
     agg_plan_w = {k: float(np.mean([r["Planned_Open_Weights"][k] for r in phase_records])) for k in ALL_EXEC_ASSETS}
@@ -556,13 +595,11 @@ if not closes_df.empty:
         with mc5:
             t_w = st.number_input("目前 TLT (%)", 0.0, 100.0, round(agg_prior_w["TLT"] * 100.0, 1), 1.0) / 100.0
         user_curr_w = {"UPRO": u_w, "EURL": e_w, "EDC": d_w, "GLD": g_w, "TLT": t_w}
-        # 手動對齊模式下，目標即為五相位匯總之計畫權重 agg_plan_w
         target_account_w = agg_plan_w
     else:
         user_curr_w = agg_prior_w
         target_account_w = agg_plan_w
 
-    # 檢查 5 個相位今日是否有任何一個相位觸發 Action != 0
     phases_trading = [r["Phase"] for r in phase_records if r["Action_Code"] != 0]
 
     latest_prices = {t: float(closes_df[t].iloc[-1]) for t in ALL_EXEC_ASSETS}
