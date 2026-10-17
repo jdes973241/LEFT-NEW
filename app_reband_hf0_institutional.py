@@ -230,7 +230,6 @@ def get_live_market_bundle():
             o_s = opens_raw[etf_1x] if etf_1x in opens_raw.columns else c_s.copy()
             p_c = closes_raw[proxy_t] if proxy_t in closes_raw.columns else None
             closes[etf_1x] = splice_early_series(c_s.ffill(), p_c).ffill()
-            # Open 在早期代理期間預設為前一日收盤價 (使隔夜報酬為 0、日內完整反映當日報酬)，上市後使用真實 Open
             first_etf_dt = c_s.first_valid_index()
             o_spliced = closes[etf_1x].shift(1).bfill()
             if first_etf_dt is not None:
@@ -1116,7 +1115,6 @@ if not closes_df.empty:
             sim_q = 0.0 if sim_rho >= RHO_EXIT else 1.0
             sim_a = min(1.0, (THETA_VOL_PCT / sim_sigma) ** 2)
             sim_b = sim_q * (0.5 * float(s_now_int) + 0.5 * sim_a)
-            # 假設其餘 4 個相位維持目前基礎權重，僅 1 個相位 (20% 資金) 變更為 sim_b
             new_acct_stock_w = 0.80 * avg_base_stock + 0.20 * sim_b
             delta_stock_w = new_acct_stock_w - avg_base_stock
             delta_usd = delta_stock_w * ACCOUNT_NAV
@@ -1124,7 +1122,7 @@ if not closes_df.empty:
                 f"- **該輪值相位狀態**：`Q = {int(sim_q)}` ({'觸發危機全退！' if sim_q==0 else '安全維持 1'}) ｜ "
                 f"平方縮放係數 `a = {sim_a:.4f}` ｜ 該相位股票目標降至 **`{sim_b*100:.2f}%`**（觸發 `Action = 2` 強制減碼覆蓋！）\n"
                 f"- **對你單一帳戶 (總淨值 `${ACCOUNT_NAV:,.0f}`) 的匯總影響**：帳戶總 `{winner_3x}` 目標由 `{avg_base_stock*100:.2f}%` 降至 **`{new_acct_stock_w*100:.2f}%`** "
-                f"$\to$ 明日開盤只需 **賣出 `{winner_3x}` `${abs(delta_usd):,.0f} USD`（約 `{abs(delta_usd)/latest_prices[winner_3x]:.1f}` 股）並買進等額 `{safe_win}`**！"
+                f"👉 明日開盤只需 **賣出 `{winner_3x}` `${abs(delta_usd):,.0f} USD`（約 `{abs(delta_usd)/latest_prices[winner_3x]:.1f}` 股）並買進等額 `{safe_win}`**！"
             )
 
     # ==========================================
@@ -1380,47 +1378,89 @@ if not closes_df.empty:
     # 分頁 3：策略架構與數學規格說明書
     # ==========================================
     with tab_doc:
-        st.subheader("📖 REBAND_HF0_200_175 策略完整架構與數學規格說明書")
+        st.subheader("📖 REBAND_HF0_200_175 與 SCOPE_HALF_F0 策略完整架構與數學規格說明書")
         st.markdown(
-            """
-### 一、 核心設計哲學：為什麼 `REBAND_HF0_200_175` 全面超越舊版策略 `O`？
+            r"""
+### 一、 核心設計哲學與三代架構演進（`Strategy O` $\rightarrow$ `SCOPE_HALF_F0` $\rightarrow$ `REBAND_HF0_200_175`）
 
-`REBAND_HF0_200_175` 是針對全球三倍槓桿指數 ETF（美股 `UPRO`、歐股 `EURL`、新興市場 `EDC`）與防禦型資產（黃金 `GLD`、長天期美債 `TLT`）設計的**機構級全天候動態資產配置系統**。它徹底解決了第一代策略 `O` 的三大結構性瓶頸：
+本系統是針對全球三倍槓桿指數 ETF（美股 `UPRO`、歐股 `EURL`、新興市場 `EDC`）與防禦型資產（黃金 `GLD`、長天期美債 `TLT`）設計的**機構級全天候動態資產配置系統**。回測圖表中的三條核心策略曲線代表三代演進關係：
 
-1. **訊號源零槓桿汙染（1x Prototype Purity）**：
-   3 倍槓桿 ETF 在高波動震盪期會產生嚴重的「波動率耗損（Volatility Drag）」與「融資利差拖累（TRS Financing Drag）」。因此本系統**所有選股排名、月度均線與 GARCH 波動率預測，100% 在 1x 原型 ETF（`SPY, VGK, EEM`）上運算**，再映射至 3x ETF 執行。
-2. **將「一刀切二元波動率開關」升級為「雙層波動率控制（$Q_{p,t}$ 危機峰值回落閘門 + $a_{p,t}$ 連續平方縮放器）」**：
-   - 舊版 `O` 在波動率剛突破 97.5% 分位數時只砍半倉（仍留 50% 3x ETF 承受暴跌），且在 V 型反彈初期因為過去 252 日分位數被墊高而遲遲無法重新進場。
-   - 新版 `REBAND_HF0_200_175` 拆解為：
-     - **危機斷路器 $Q_{p,t} \in \{0, 1\}$**：當預測波動率超過 252 日中位數的 **2.5 倍（$\rho_{p,t} \ge 2.5$）** 時，直接將股票部位**瞬間歸零（$Q=0$）**，100% 轉入防禦資產避開熔斷主跌段；一旦波動率從危機峰值**回落 40%（$\sigma_{p,t} \le 0.60 \sigma_{\text{peak}}$）**，不必苦等 252 日分位數下降，立即在 V 型反轉底部**重新進場（$Q=1$）**！
-     - **常態平方縮放器 $a_{p,t} \in (0, 1]$**：當 $\sigma_{p,t} > 41\%$ 時，依 $a_{p,t} = \min(1, (41/\sigma_{p,t})^2)$ 平滑縮減槓桿部位。
-3. **Vanguard 200 / 175 bps 成本走廊與 7 大非對稱強制覆蓋規則（Cost-Aware Corridor + Mandatory Risk-Off Override）**：
-   - **平時免交易（省下 80% 換手率）**：只要當日沒有任何關鍵訊號翻轉或減碼指令，且實際持倉因日內價格漲跌產生的漂移小於 **200 bps（2.00%）**，當天開盤就 **`Action = 0`（保留原股數、完全不交易）**。
-   - **觸及邊界緩衝拉回**：若純價格漂移 $\ge 200\text{ bps}$，僅部分調倉拉回至 **175 bps（1.75%）** 邊界（`Action = 1`）。
-   - **減碼與訊號翻轉零延遲**：一旦觸發 7 大強制規則（特別是第 7 條：**當日目標股票預算調降 $B_{p,t} < B_{p,t-1}$**），系統**立即無視 200 bps 走廊，強制 100% 精確執行減碼（`Action = 2`）**！
+1. **第一代基準：`Strategy O`（舊版分位數二元閘門）**
+   - **架構**：月度 `SMA6` 佔 $50\%$ 權重 + 日頻 $\text{GARCH}(1,1)$ 過去 252 日分位數二元開關 $G_{p,t} \in \{0, 1\}$（突破 $97.5\%$ 分位數減半倉、跌回 $90\%$ 分位數恢復滿倉）佔 $50\%$ 權重。
+   - **結構瓶頸**：在 2020 年 3 月等系統性崩盤時，即使 $\text{GARCH}$ 觸發退出，在跌破月均線前仍會殘留 $50\%$ 的 3x ETF 部位承受暴跌；而在 V 型反轉初期，又因過去 252 日的歷史分位數被極端高波動墊高，導致遲遲無法重新進場（分位數鎖死效應）。
+2. **第二代純訊號核心：`SCOPE_HALF_F0`（無護欄每日精確調倉版）**
+   - **架構**：將波動率控制拆解為 **「外層危機峰值回落斷路器 $Q_{p,t} \in \{0, 1\}$」** 與 **「內層常態平方反比連續縮放器 $a_{p,t} \in (0, 1]$」**，並在每個交易日開盤 100% 精確交易至理論目標權重（無設交易緩衝走廊，`F0` 代表基礎權重無額外折減 Floor = 0）。
+   - **核心突破**：遇到相對波動率暴衝（$\rho_{p,t} \ge 2.5$）時直接將槓桿股票**瞬間歸零（$Q_{p,t}=0$）**，並在波動率自危機峰值回落 $40\%$ 時**立即在 V 轉底部重新進場（$Q_{p,t}=1$）**，徹底消除了 `O` 的分位數鎖死延遲。
+3. **第三代實盤旗艦版：`REBAND_HF0_200_175`（本系統：加入 Vanguard 200/175 bps 成本走廊 + 7 大強制減碼覆蓋）**
+   - **架構**：100% 繼承 `SCOPE_HALF_F0` 的訊號引擎，但在執行層加入 **「偏離 $< 200\text{ bps}$ 免交易（`Action = 0`）、偏離 $\ge 200\text{ bps}$ 拉回至 $175\text{ bps}$（`Action = 1`）、遇到任何訊號翻轉或目標股票預算下調時立即強制精確執行（`Action = 2`）」** 的非對稱護欄。
+   - **核心優勢**：在維持甚至微幅超越 `SCOPE_HALF_F0` 淨年化報酬的同時，**省下超過 $93\%$ 的日常無謂微調交易日**，讓單一帳戶實盤操作極度輕鬆！
+"""
+        )
 
----
+        st.divider()
+        st.markdown("### 二、 四大模組精確數學公式")
 
-### 二、 四大模組精確數學公式
-
+        st.markdown(
+            r"""
 #### 模組 1：月底非重疊三段風險調整動能選股（1x 原型）
-在每個月最後一個交易日收盤，對 $i \in \{\text{SPY}, \text{VGK}, \text{EEM}\}$ 計算過去 12 個月拆分為三段非重疊區間 $(0,3]\text{M}$、$(3,7]\text{M}$、$(7,12]\text{M}$ 的報酬率，並除以 252 日年化波動率 $\sigma^{(252)}_{i,m}$：
-$$\text{Score}_{i,m} = \frac{1}{3} \left( \frac{R^{(0,3)}_{i,m}}{\sigma^{(252)}_{i,m}} + \frac{R^{(3,7)}_{i,m}}{\sigma^{(252)}_{i,m}} + \frac{R^{(7,12)}_{i,m}}{\sigma^{(252)}_{i,m}} \right)$$
-得分最高者之對應 3x ETF（$\text{SPY}\to\text{UPRO}, \text{VGK}\to\text{EURL}, \text{EEM}\to\text{EDC}$）即為次月唯一進攻標的 $L_t$。
+在每個月最後一個交易日收盤，對 1x 原型指數 ETF $i \in \{\text{SPY}, \text{VGK}, \text{EEM}\}$ 計算過去 12 個月拆分為三段非重疊區間 $(0,3]\text{M}$、$(3,7]\text{M}$、$(7,12]\text{M}$ 的累積報酬率，並除以 252 日年化實現波動率 $\sigma^{(252)}_{i,m}$：
+"""
+        )
+        st.latex(
+            r"\text{Score}_{i,m} = \frac{1}{3} \left( \frac{R^{(0,3)}_{i,m}}{\sigma^{(252)}_{i,m}} + \frac{R^{(3,7)}_{i,m}}{\sigma^{(252)}_{i,m}} + \frac{R^{(7,12)}_{i,m}}{\sigma^{(252)}_{i,m}} \right)"
+        )
+        st.markdown(
+            r"得分最高者之對應 3x 槓桿 ETF（$\text{SPY} \rightarrow \text{UPRO},\; \text{VGK} \rightarrow \text{EURL},\; \text{EEM} \rightarrow \text{EDC}$）即為次月唯一進攻標的 $L_t$。"
+        )
 
+        st.markdown(
+            r"""
 #### 模組 2：月度 6 個月簡單移動平均趨勢濾網（$\text{SMA}_6$）
 在月底收盤檢驗勝出之 1x 原型收盤價是否嚴格大於過去 6 個月底收盤價均值：
-$$S_t = \mathbb{I}\!\left( P_{L_t, m} > \frac{1}{6}\sum_{k=0}^{5} P_{L_t, m-k} \right) \in \{0, 1\}$$
-
-#### 模組 3：五相位交錯 Student-$t$ $\text{GARCH}(1,1)$ 與基礎股票預算 $B_{p,t}$
-將資金均分為 5 個獨立子相位 $p \in \{0, 1, 2, 3, 4\}$（各佔 20% 資金）。在交易日 $t$，僅輪值相位 $p \equiv (t - 504) \pmod 5$ 使用最新 504 日 1x 原型日報酬擬合 Student-$t$ $\text{GARCH}(1,1)$ 預測年化波動率 $\sigma_{p,t}$，並計算相對於過去 252 日預測中位數之警報比 $\rho_{p,t} = \sigma_{p,t} / \text{Med}_{252}(\sigma)_{p,t}$：
-$$B_{p,t} = Q_{p,t} \times \left( 0.5 \cdot S_t + 0.5 \cdot \min\!\left[1,\; \left(\frac{41\%}{\sigma_{p,t}}\right)^2\right] \right)$$
-剩餘預算 $1 - B_{p,t}$ 全數配置於當月 `GLD` 與 `TLT` 中 $(6\text{M} + 12\text{M})/2$ 平均動能較高之避險資產 $D_t$。
-
-#### 模組 4：單一帳戶匯總執行公式
-五個相位各自獨立透過 `200 / 175 bps` 護欄決定今日開盤計畫權重 $w^{\text{plan}}_{p,t}$ 後，你在單一券商帳戶只需執行五相位的算術平均權重：
-$$\bar{w}^{\text{plan}}_t = \frac{1}{5} \sum_{p=0}^{4} w^{\text{plan}}_{p,t}$$
 """
+        )
+        st.latex(
+            r"S_t = \mathbb{I}\!\left( P_{L_t, m} > \frac{1}{6}\sum_{k=0}^{5} P_{L_t, m-k} \right) \in \{0, 1\}"
+        )
+
+        st.markdown(
+            r"""
+#### 模組 3：五相位交錯 Student-$t$ $\text{GARCH}(1,1)$ 與雙層波動率預算 $B_{p,t}$（`SCOPE_HALF_F0` 核心）
+將資金均分為 5 個獨立子相位 $p \in \{0, 1, 2, 3, 4\}$（各佔 $20\%$ 資金）。在交易日 $t$，僅輪值相位 $p \equiv (t - 504) \pmod 5$ 使用最新 504 日 1x 原型日報酬擬合 Student-$t$ $\text{GARCH}(1,1)$ 預測年化波動率 $\sigma_{p,t}$，並計算相對於過去 252 日預測中位數之警報比 $\rho_{p,t} = \sigma_{p,t} / \text{Med}_{252}(\sigma)_{p,t}$：
+
+- **外層危機峰值回落斷路器 $Q_{p,t} \in \{0, 1\}$**：
+  - **危機全退（$1 \rightarrow 0$）**：當 $\rho_{p,t} \ge 2.50$（且若為復歸後再次觸發，需同時滿足 $\sigma_{p,t} \ge 1.25 \cdot \sigma^{\text{trough}}_{p,t}$）時，令 $Q_{p,t} = 0$。
+  - **危機解除或峰值回落復歸（$0 \rightarrow 1$）**：在退出期間追蹤波動率峰值 $\sigma^{\text{peak}}_{p,t} = \max \sigma$；一旦 $\rho_{p,t} \le 1.25$ **或波動率自峰值回落達 $40\%$（$\sigma_{p,t} \le 0.60 \cdot \sigma^{\text{peak}}_{p,t}$）**，立即恢復 $Q_{p,t} = 1$。
+- **內層常態平方反比縮放器 $a_{p,t} \in (0, 1]$ 與基礎股票預算 $B_{p,t}$**：
+"""
+        )
+        st.latex(
+            r"a_{p,t} = \min\!\left(1,\; \left(\frac{41\%}{\sigma_{p,t}}\right)^2\right), \qquad B_{p,t} = Q_{p,t} \times \left( 0.5 \cdot S_t + 0.5 \cdot a_{p,t} \right)"
+        )
+        st.markdown(
+            r"剩餘預算 $1 - B_{p,t}$ 全數配置於當月 `GLD` 與 `TLT` 中 $(6\text{M} + 12\text{M})/2$ 平均動能較高之避險資產 $D_t$。"
+        )
+
+        st.markdown(
+            r"""
+#### 模組 4：Vanguard `200 / 175 bps` 成本走廊與單一帳戶匯總執行公式
+令子相位 $p$ 於昨日收盤之實際漂移後持倉權重為 $w^{\text{close}}_{p,t-1}$，今日基礎目標權重為 $w^{\text{base}}_{p,t}$，最大單一資產偏離距離為 $d_{p,t} = \max_k \vert{}w^{\text{close}}_{p,t-1,k} - w^{\text{base}}_{p,t,k}\vert{}$：
+"""
+        )
+        st.latex(
+            r"w^{\text{plan}}_{p,t} = \begin{cases} w^{\text{base}}_{p,t}, & \text{if Mandatory Override } (\text{Action}=2) \\[6pt] w^{\text{base}}_{p,t} + \dfrac{0.0175}{d_{p,t}}\left(w^{\text{close}}_{p,t-1} - w^{\text{base}}_{p,t}\right), & \text{if } d_{p,t} \ge 0.0200 \quad (\text{Action}=1) \\[8pt] w^{\text{close}}_{p,t-1}, & \text{if } d_{p,t} < 0.0200 \quad (\text{Action}=0) \end{cases}"
+        )
+        st.markdown(
+            r"""
+- **`Action = 2`（強制精確覆蓋）**：當觸發 7 大強制規則（初始建倉、進攻標的 $L_t$ 換股、`SMA6` $S_t$ 翻轉、危機閘門 $Q_{p,t}$ 翻轉、避險資產 $D_t$ 換股、非零持倉集合改變、或**股票預算減碼 $B_{p,t} < B_{p,t-1}$**）時，100% 精確交易至 $w^{\text{base}}_{p,t}$。
+- **`Action = 1`（緩衝拉回）**：無強制規則但純漂移 $d_{p,t} \ge 200\text{ bps}$ 時，僅部分調倉拉回至 $175\text{ bps}$ 邊界。
+- **`Action = 0`（免交易抱牢）**：無強制規則且純漂移 $d_{p,t} < 200\text{ bps}$ 時，保留原股數完全不交易。
+
+五個相位各自獨立決定今日開盤計畫權重 $w^{\text{plan}}_{p,t}$ 後，你在**單一券商帳戶**只需執行五相位的算術平均權重：
+"""
+        )
+        st.latex(
+            r"\bar{w}^{\text{plan}}_t = \frac{1}{5} \sum_{p=0}^{4} w^{\text{plan}}_{p,t}"
         )
 
         st.subheader("🏛️ 三、 機構鎖定歷史審計基準表 (Locked Institutional Audit Benchmarks)")
