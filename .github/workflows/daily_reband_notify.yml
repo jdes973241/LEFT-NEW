@@ -1,0 +1,61 @@
+name: Daily REBAND_HF0_200_0 Signal & Portfolio Change Notifier
+
+on:
+  # 每個美股交易日收盤後自動執行：
+  # UTC 21:30 (週一至週五) = 台灣時間週二至週六清晨 05:30 (美股收盤後 30~90 分鐘，確保 Yahoo Finance 日 K 已完整結算)
+  schedule:
+    - cron: '30 21 * * 1-5'
+
+  # 支援在 GitHub Actions 頁面手動一鍵點擊「Run workflow」立即測試收信/收推播
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: '是否強制發送測試通知 (即使今日無部位變動也發送)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas numpy scipy arch pytz
+
+      - name: Run REBAND_HF0_200_0 Change Detection & Notification
+        env:
+          # 帳戶總淨值預設值 (可於 GitHub Secrets 設定 ACCOUNT_NAV 覆蓋)
+          ACCOUNT_NAV: ${{ secrets.ACCOUNT_NAV || '100000' }}
+          # 預設僅在「有變動 (換股或觸發調倉)」時才發通知；手動點擊測試時強制發送
+          NOTIFY_ONLY_ON_CHANGE: 'true'
+          FORCE_SEND: ${{ github.event.inputs.force_send || 'false' }}
+
+          # --- 管道 1：Email 通知 (Gmail 帳號與 16 位元應用程式密碼) ---
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+
+          # --- 管道 2：iPhone 鎖定畫面原生推播 (Bark App URL，選填) ---
+          BARK_URL: ${{ secrets.BARK_URL }}
+
+          # --- 管道 3：Telegram Bot 推播 (選填) ---
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python notify_reband_changes.py
