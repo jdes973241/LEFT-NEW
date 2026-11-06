@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import warnings
 
 import altair as alt
@@ -47,6 +47,7 @@ TRADE_ETFS_3X = ["UPRO", "EURL", "EDC"]
 PROTO_ETFS_1X = ["SPY", "VGK", "EEM"]
 SAFE_POOL = ["GLD", "TLT"]
 ALL_EXEC_ASSETS = ["UPRO", "EURL", "EDC", "GLD", "TLT"]
+CORE_LIVE_ETFS = TRADE_ETFS_3X + PROTO_ETFS_1X + SAFE_POOL
 
 # 超長歷史 (1995~2005 ETF 上市前) 1x 指數/共同基金無縫代理映射
 LONG_HIST_PROXIES = {
@@ -84,8 +85,13 @@ with st.sidebar:
     st.header("🔧 單一帳戶下單與回測設定")
     try:
         tz_tw = pytz.timezone("Asia/Taipei")
+        tz_ny = pytz.timezone("America/New_York")
         now_tw = datetime.now(tz_tw)
-        st.info(f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}")
+        now_ny = datetime.now(tz_ny)
+        st.info(
+            f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"🇺🇸 美東時間: {now_ny.strftime('%Y-%m-%d %H:%M %Z')}"
+        )
     except Exception as e:
         st.error(f"時區錯誤: {e}")
 
@@ -113,7 +119,7 @@ with st.sidebar:
 
 
 # ==========================================
-# 2. 數據下載與防呆工具函式 (相容 Python 3.14 / Pandas 2.2+ / 3.0)
+# 2. 數據下載與三階段即時收盤補齊引擎 (解決 Yahoo 長天期快取延遲)
 # ==========================================
 def safe_row_idxmax(df: pd.DataFrame, default_col: str) -> pd.Series:
     """在任何 Pandas 版本下安全取得每列最大值欄位名稱（遇全 NaN 列自動回傳 default_col，絕不拋出 ValueError）。"""
@@ -155,15 +161,134 @@ def splice_early_series(primary_s: pd.Series, proxy_s: pd.Series) -> pd.Series:
     return s
 
 
-@st.cache_data(ttl=300, show_spinner="正在從 Yahoo Finance 下載全球 ETF 與超長歷史基準數據 (1995–至今)...")
+def extract_close_open_from_yf(raw: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    closes = pd.DataFrame(index=raw.index)
+    opens = pd.DataFrame(index=raw.index)
+    if raw is None or raw.empty:
+        return closes, opens
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = set(raw.columns.get_level_values(0))
+        lvl1 = set(raw.columns.get_level_values(1))
+        for t in tickers:
+            if t in lvl0:
+                t_df = raw[t]
+                if "Close" in t_df.columns:
+                    closes[t] = pd.to_numeric(t_df["Close"], errors="coerce")
+                elif "Price" in t_df.columns:
+                    closes[t] = pd.to_numeric(t_df["Price"], errors="coerce")
+                if "Open" in t_df.columns:
+                    opens[t] = pd.to_numeric(t_df["Open"], errors="coerce")
+                elif t in closes.columns:
+                    opens[t] = closes[t]
+            elif t in lvl1:
+                if ("Close", t) in raw.columns:
+                    closes[t] = pd.to_numeric(raw[("Close", t)], errors="coerce")
+                if ("Open", t) in raw.columns:
+                    opens[t] = pd.to_numeric(raw[("Open", t)], errors="coerce")
+                elif t in closes.columns:
+                    opens[t] = closes[t]
+    else:
+        for t in tickers:
+            if t in raw.columns:
+                closes[t] = pd.to_numeric(raw[t], errors="coerce")
+                opens[t] = closes[t]
+    return closes, opens
+
+
+def patch_latest_us_session(
+    closes: pd.DataFrame, opens: pd.DataFrame, core_tickers: list[str]
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """三階段即時收盤補齊機制：
+    1. 針對 8 檔核心 ETF 單獨抓取 period='5d', interval='1d'，繞過 Yahoo 31 年長天期歷史 CDN 快取與共同基金結算延遲。
+    2. 若美股剛收盤數小時內 Yahoo 日 K (1d) 尚未滾動更新，自動抓取 period='5d', interval='15m' (prepost=False) 正規盤分鐘線，
+       只要當日 15:45 EST 收盤前最後一根 15m K 線已產生，立即合成當日精確 Open 與 Close 補入序列。
+    """
+    patch_note = "標準日K (1d)"
+    # Stage 2: 單獨針對 8 檔核心 ETF 抓取近 5 日 1d 報價 (不含共同基金)
+    try:
+        raw_5d = yf.download(
+            core_tickers,
+            period="5d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            group_by="ticker",
+        )
+        c_5d, o_5d = extract_close_open_from_yf(raw_5d, core_tickers)
+        if not c_5d.empty and "SPY" in c_5d.columns:
+            if c_5d.index.tz is not None:
+                c_5d.index = c_5d.index.tz_localize(None)
+                o_5d.index = o_5d.index.tz_localize(None)
+            c_5d = c_5d.loc[c_5d["SPY"].dropna().index]
+            for dt in c_5d.index:
+                for t in core_tickers:
+                    if t in c_5d.columns and pd.notna(c_5d.loc[dt, t]):
+                        closes.loc[dt, t] = float(c_5d.loc[dt, t])
+                    if t in o_5d.columns and pd.notna(o_5d.loc[dt, t]):
+                        opens.loc[dt, t] = float(o_5d.loc[dt, t])
+            closes = closes.sort_index()
+            opens = opens.sort_index()
+    except Exception:
+        pass
+
+    # Stage 3: 檢查正规盤 15m K 線是否有尚未寫入 1d 日表的最新已收盤交易日
+    try:
+        tz_ny = pytz.timezone("America/New_York")
+        raw_15m = yf.download(
+            core_tickers,
+            period="5d",
+            interval="15m",
+            prepost=False,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            group_by="ticker",
+        )
+        c_15m, o_15m = extract_close_open_from_yf(raw_15m, core_tickers)
+        if not c_15m.empty and "SPY" in c_15m.columns:
+            if c_15m.index.tz is None:
+                c_15m.index = c_15m.index.tz_localize("UTC").tz_convert(tz_ny)
+                o_15m.index = o_15m.index.tz_localize("UTC").tz_convert(tz_ny)
+            else:
+                c_15m.index = c_15m.index.tz_convert(tz_ny)
+                o_15m.index = o_15m.index.tz_convert(tz_ny)
+
+            c_15m = c_15m.loc[c_15m["SPY"].dropna().index]
+            o_15m = o_15m.reindex(c_15m.index)
+
+            for d_val, grp_c in c_15m.groupby(c_15m.index.date):
+                ts_day = pd.Timestamp(d_val)
+                last_bar_tm = grp_c.index[-1]
+                # 確認該交易日已收盤 (最後一根 15m K 線時間 >= 15:45 美東時間)
+                is_session_closed = (last_bar_tm.hour > 15) or (last_bar_tm.hour == 15 and last_bar_tm.minute >= 45)
+                if is_session_closed and (ts_day not in closes.index):
+                    grp_o = o_15m.loc[grp_c.index]
+                    for t in core_tickers:
+                        s_c = grp_c[t].dropna() if t in grp_c.columns else pd.Series(dtype=float)
+                        s_o = grp_o[t].dropna() if t in grp_o.columns else pd.Series(dtype=float)
+                        if not s_c.empty:
+                            closes.loc[ts_day, t] = float(s_c.iloc[-1])
+                            opens.loc[ts_day, t] = float(s_o.iloc[0]) if not s_o.empty else float(s_c.iloc[0])
+                    patch_note = f"盤後 15m 即時合成日K (已補齊 {ts_day.strftime('%Y-%m-%d')} 收盤價)"
+            closes = closes.sort_index()
+            opens = opens.sort_index()
+    except Exception:
+        pass
+
+    return closes.ffill().bfill(), opens.ffill().bfill(), patch_note
+
+
+@st.cache_data(ttl=180, show_spinner="正在從 Yahoo Finance 下載全球 ETF 與最新美股收盤數據 (1995–至今)...")
 def get_live_market_bundle():
-    core_tickers = TRADE_ETFS_3X + PROTO_ETFS_1X + SAFE_POOL
     proxy_tickers = list(LONG_HIST_PROXIES.values()) + ["^IRX"]
-    all_tickers = core_tickers + proxy_tickers
+    all_tickers = CORE_LIVE_ETFS + proxy_tickers
+    end_tomorrow = (datetime.now(pytz.timezone("America/New_York")) + timedelta(days=2)).strftime("%Y-%m-%d")
     try:
         raw = yf.download(
             all_tickers,
             start=EXPECTED_DATA_START.strftime("%Y-%m-%d"),
+            end=end_tomorrow,
             interval="1d",
             auto_adjust=True,
             progress=False,
@@ -171,37 +296,9 @@ def get_live_market_bundle():
             group_by="ticker",
         )
         if raw.empty:
-            return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float)
+            return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float), "無資料"
 
-        closes_raw = pd.DataFrame(index=raw.index)
-        opens_raw = pd.DataFrame(index=raw.index)
-
-        if isinstance(raw.columns, pd.MultiIndex):
-            lvl0 = set(raw.columns.get_level_values(0))
-            lvl1 = set(raw.columns.get_level_values(1))
-            for t in all_tickers:
-                if t in lvl0:
-                    t_df = raw[t]
-                    if "Close" in t_df.columns:
-                        closes_raw[t] = pd.to_numeric(t_df["Close"], errors="coerce")
-                    elif "Price" in t_df.columns:
-                        closes_raw[t] = pd.to_numeric(t_df["Price"], errors="coerce")
-                    if "Open" in t_df.columns:
-                        opens_raw[t] = pd.to_numeric(t_df["Open"], errors="coerce")
-                    elif t in closes_raw.columns:
-                        opens_raw[t] = closes_raw[t]
-                elif t in lvl1:
-                    if ("Close", t) in raw.columns:
-                        closes_raw[t] = pd.to_numeric(raw[("Close", t)], errors="coerce")
-                    if ("Open", t) in raw.columns:
-                        opens_raw[t] = pd.to_numeric(raw[("Open", t)], errors="coerce")
-                    elif t in closes_raw.columns:
-                        opens_raw[t] = closes_raw[t]
-        else:
-            for t in all_tickers:
-                if t in raw.columns:
-                    closes_raw[t] = pd.to_numeric(raw[t], errors="coerce")
-                    opens_raw[t] = closes_raw[t]
+        closes_raw, opens_raw = extract_close_open_from_yf(raw, all_tickers)
 
         if closes_raw.index.tz is not None:
             closes_raw.index = closes_raw.index.tz_localize(None)
@@ -231,7 +328,6 @@ def get_live_market_bundle():
             o_s = opens_raw[etf_1x] if etf_1x in opens_raw.columns else c_s.copy()
             p_c = closes_raw[proxy_t] if proxy_t in closes_raw.columns else None
             closes[etf_1x] = splice_early_series(c_s.ffill(), p_c).ffill()
-            # Open 在早期代理期間等於 Close (因為共同基金每日僅一價)，上市後使用真實 Open
             first_etf_dt = c_s.first_valid_index()
             o_spliced = closes[etf_1x].shift(1).bfill()
             if first_etf_dt is not None:
@@ -260,12 +356,13 @@ def get_live_market_bundle():
             closes[t3x] = c3_full
             opens[t3x] = o3_full
 
-        closes = closes.ffill().bfill()
-        opens = opens.ffill().bfill()
-        return closes, opens, rf_ann
+        # 關鍵升級：執行三階段即時收盤補齊 (繞過長天期快取延遲，確保美股剛收盤立即納入當日最新數據)
+        closes, opens, patch_note = patch_latest_us_session(closes, opens, CORE_LIVE_ETFS)
+        rf_ann = rf_ann.reindex(closes.index).ffill().bfill()
+        return closes, opens, rf_ann, patch_note
     except Exception as e:
         st.error(f"數據下載失敗: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float)
+        return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float), "下載失敗"
 
 
 # ==========================================
@@ -449,8 +546,10 @@ def run_q_state_machine_1d(vol_arr: np.ndarray, med_arr: np.ndarray) -> tuple[np
     return q_out, a_out
 
 
-@st.cache_data(ttl=600, show_spinner="正在執行實盤 5 相位 Student-t GARCH(1,1) 與 REBAND 200/0 bps 狀態自動回放...")
-def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, force_eom_flag: bool):
+@st.cache_data(ttl=180, show_spinner="正在執行實盤 5 相位 Student-t GARCH(1,1) 與 REBAND 200/0 bps 狀態自動回放...")
+def run_5phase_live_reband_replay(
+    closes: pd.DataFrame, opens: pd.DataFrame, force_eom_flag: bool, last_dt_key: str
+):
     """自動回放近期 5 相位 (Phase 0..4) 的精確 Student-t GARCH(1,1)、Q、a 與 200/0 bps 實際持倉漂移狀態。"""
     m_sig = calculate_monthly_signals_1x(closes)
     tail_n = GARCH_WINDOW + QUANTILE_WINDOW + 140
@@ -655,8 +754,10 @@ def run_5phase_live_reband_replay(closes: pd.DataFrame, opens: pd.DataFrame, for
 # ==========================================
 # 5. 超長歷史 (1998–至今) 高速 5 相位向量化回測引擎與量化指標計算器
 # ==========================================
-@st.cache_data(ttl=600, show_spinner="正在建構 1998–至今 (28+ 年) 五相位超長歷史回測曲線與滾動指標...")
-def run_ultra_long_history_backtest(closes: pd.DataFrame, opens: pd.DataFrame, rf_ann: pd.Series, fee_bps: int):
+@st.cache_data(ttl=180, show_spinner="正在建構 1998–至今 (28+ 年) 五相位超長歷史回測曲線與滾動指標...")
+def run_ultra_long_history_backtest(
+    closes: pd.DataFrame, opens: pd.DataFrame, rf_ann: pd.Series, fee_bps: int, last_dt_key: str
+):
     """高速計算 1998–至今之 5 相位 REBAND_HF0_200_0、SCOPE_HALF_F0、原版策略 O 與 SPY 買入持有完整日頻回測。"""
     m_sig = calculate_monthly_signals_1x(closes)
     dates = closes.index
@@ -922,7 +1023,6 @@ def compute_quant_metrics_table(bt_sub: pd.DataFrame, fee_bps: int) -> pd.DataFr
         calmar = float(cagr / abs(max_dd)) if abs(max_dd) > 1e-9 else np.nan
         ulcer_idx = float(np.sqrt(np.mean((dd * 100.0) ** 2)))
 
-        # 最長水下恢復天數 (Max Drawdown Duration in trading days)
         underwater = dd < -1e-6
         max_uw_days = 0
         curr_uw = 0
@@ -934,7 +1034,6 @@ def compute_quant_metrics_table(bt_sub: pd.DataFrame, fee_bps: int) -> pd.DataFr
             else:
                 curr_uw = 0
 
-        # 月勝率與年勝率
         s_r = pd.Series(r, index=bt_sub.index)
         m_rets = s_r.groupby(s_r.index.to_period("M")).apply(lambda x: float(np.prod(1.0 + x) - 1.0))
         y_rets = s_r.groupby(s_r.index.year).apply(lambda x: float(np.prod(1.0 + x) - 1.0))
@@ -984,13 +1083,14 @@ def compute_quant_metrics_table(bt_sub: pd.DataFrame, fee_bps: int) -> pd.DataFr
 st.title("🛡️ REBAND_HF0_200_0 機構實盤部署與超長歷史量化回測系統")
 st.caption(
     "整合：單一帳戶匯總下單指令 ｜ 進攻與避險統一四等分日曆季度 (0,3,6,9,12)/Vol252 動能 ＋ 月度 SMA6 ｜ "
-    "5 相位 Student-t GARCH(1,1) 與 200/0 bps 護欄監控 ｜ 1998–至今 (28+ 年) 淨值、回撤、5Y/10Y 滾動 CAGR 圖表"
+    "5 相位 Student-t GARCH(1,1) 與 200/0 bps 護欄監控 ｜ 三階段盤後即時收盤價補齊"
 )
 
-closes_df, opens_df, rf_series = get_live_market_bundle()
+closes_df, opens_df, rf_series, patch_source_note = get_live_market_bundle()
 
 if not closes_df.empty:
-    m_sig, phase_records = run_5phase_live_reband_replay(closes_df, opens_df, FORCE_EOM)
+    last_dt_str = closes_df.index[-1].strftime("%Y-%m-%d")
+    m_sig, phase_records = run_5phase_live_reband_replay(closes_df, opens_df, FORCE_EOM, last_dt_str)
     sel_df = m_sig["sel_df"]
     safe_df = m_sig["safe_df"]
     ref_date = m_sig["ref_date"]
@@ -1004,7 +1104,7 @@ if not closes_df.empty:
 
     st.info(
         f"📅 **月度訊號鎖定日**: `{ref_date.strftime('%Y-%m-%d')}` ｜ "
-        f"📈 **最新日頻收盤數據**: `{closes_df.index[-1].strftime('%Y-%m-%d')}` ｜ "
+        f"📈 **最新日頻收盤數據**: `{last_dt_str}` ({patch_source_note}) ｜ "
         f"🎯 **下一交易日開盤執行標的**: 進攻 **`{winner_3x}`** (訊號源 `{MAPPING[winner_3x]}`) ＋ 防禦 **`{safe_win}`**"
     )
 
@@ -1141,7 +1241,6 @@ if not closes_df.empty:
             sim_q = 0.0 if sim_rho >= RHO_EXIT else 1.0
             sim_a = min(1.0, (THETA_VOL_PCT / sim_sigma) ** 2)
             sim_b = sim_q * (0.5 * float(s_now_int) + 0.5 * sim_a)
-            # 假設其餘 4 個相位維持目前基礎權重，僅 1 個相位 (20% 資金) 變更為 sim_b
             new_acct_stock_w = 0.80 * avg_base_stock + 0.20 * sim_b
             delta_stock_w = new_acct_stock_w - avg_base_stock
             delta_usd = delta_stock_w * ACCOUNT_NAV
@@ -1156,7 +1255,9 @@ if not closes_df.empty:
     # 分頁 2：最長歷史量化回測與滾動圖表 (1998–至今)
     # ==========================================
     with tab_bt:
-        bt_full_df, hist_rot_df = run_ultra_long_history_backtest(closes_df, opens_df, rf_series, FEE_BPS)
+        bt_full_df, hist_rot_df = run_ultra_long_history_backtest(
+            closes_df, opens_df, rf_series, FEE_BPS, last_dt_str
+        )
 
         st.subheader("⏱️ 選擇歷史回測檢視區間與座標模式")
         ctrl1, ctrl2 = st.columns([2, 1])
@@ -1199,7 +1300,6 @@ if not closes_df.empty:
         metrics_tbl = compute_quant_metrics_table(bt_sub, FEE_BPS)
         st.dataframe(metrics_tbl, use_container_width=True)
 
-        # 準備繪圖序列 (為了讓 28 年 7,000 點在瀏覽器極速渲染，每 5 個交易日取樣一次繪圖點，並保留最後一日)
         nav_df = pd.DataFrame(index=bt_sub.index)
         dd_df = pd.DataFrame(index=bt_sub.index)
         label_map = {
@@ -1364,7 +1464,6 @@ if not closes_df.empty:
                 )
                 st.altair_chart(ch_r10 + zero_rule10, use_container_width=True)
 
-        # 滾動 5Y / 10Y 分位數統計表
         roll_stat_rows = []
         for lab in label_map.values():
             s5 = roll_5y_df[lab].dropna()
@@ -1560,5 +1659,5 @@ if not closes_df.empty:
         st.dataframe(closes_df.tail(15).style.format("{:.2f}"), use_container_width=True)
         st.caption(
             f"✅ 資料序列健康度檢查通過：共載入 `{len(closes_df):,}` 個交易日 "
-            f"（起始日 `{closes_df.index[0].strftime('%Y-%m-%d')}`，最新收盤日 `{closes_df.index[-1].strftime('%Y-%m-%d')}`）。"
+            f"（起始日 `{closes_df.index[0].strftime('%Y-%m-%d')}`，最新收盤日 `{last_dt_str}` ｜ 資料來源：`{patch_source_note}`）。"
         )
