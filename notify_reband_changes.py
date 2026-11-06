@@ -2,32 +2,23 @@
 """REBAND_HF0_200_0 自動化變動偵測與多管道推播通知腳本 (notify_reband_changes.py).
 
 功能特色：
-1. 與 Streamlit 旗艦版 (app_reband_hf0_institutional.py) 100% 同步的運算核心：
+1. 三階段即時收盤補齊機制 (3-Stage Live Post-Close Bar Patching)：
+   - 解決 Yahoo Finance 長天期歷史查詢 (start='2018-01-01') 的 CDN 快取延遲問題
+   - 自動結合「近 5 日日K (period='5d', interval='1d')」與「近 5 日正規盤 15 分鐘 K 線 (interval='15m', prepost=False)」，
+     只要美東時間 16:00 收盤 (15:45 最後一根 15m K 線完成)，立即合成當日精確 Open 與 Close 納入 GARCH 與護欄計算！
+2. 與 Streamlit 旗艦版 (app_reband_hf0_institutional.py) 100% 同步的運算核心：
    - 進攻與避險統一採用四等分標準日曆季度 (0, 3, 6, 9, 12) / Vol252 風險調整動能
    - 月度 SMA6 趨勢濾網 + 5 相位 Student-t GARCH(1,1) + Q 危機斷路器 + a 常態縮放器
    - 200 / 0 bps 零殘差執行護欄與 7 大強制減碼覆蓋規則
-2. 智慧變動偵測 (Change Detection)：
-   - 自動比對「前一日收盤至今日開盤」與「今日收盤至明日開盤」的五相位狀態
-   - 當發生以下任一情況時判定為【有變動 (Triggered)】：
-     (a) 進攻標的 (UPRO/EURL/EDC) 或避險標的 (GLD/TLT) 發生月度輪動轉換
-     (b) 五個相位中有任何一個相位觸發交易 (Action = 1 護欄歸位 或 Action = 2 強制覆蓋)
-     (c) 單一帳戶五相位匯總計畫持股比例發生改變 (|ΔWeight| >= 0.05%)
-3. 多管道通知支援 (透過環境變數 / GitHub Secrets 設定)：
-   - Email 郵件通知 (支援 Gmail SMTP 應用程式密碼，發送精美 HTML 表格與下單指令)
-   - iPhone / iMessage / 行動推播：
-     * 方式 A：Email 寄送至 iCloud 信箱 + iPhone「自動化 (Shortcuts)」收到特定主旨自動轉發 iMessage
-     * 方式 B：Bark App (iOS 原生 APNs 推播，免開 App 零延遲鎖定畫面通知)
-     * 方式 C：Telegram Bot / Discord / Slack Webhook
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import json
 import os
 import smtplib
-import urllib.parse
 import urllib.request
 import warnings
 
@@ -48,6 +39,7 @@ TRADE_ETFS_3X = ["UPRO", "EURL", "EDC"]
 PROTO_ETFS_1X = ["SPY", "VGK", "EEM"]
 SAFE_POOL = ["GLD", "TLT"]
 ALL_EXEC_ASSETS = ["UPRO", "EURL", "EDC", "GLD", "TLT"]
+CORE_LIVE_ETFS = TRADE_ETFS_3X + PROTO_ETFS_1X + SAFE_POOL
 
 SMA_MONTHS = 6
 GARCH_WINDOW = 504
@@ -68,7 +60,7 @@ DATA_START_DATE = "2018-01-01"
 
 
 # ==========================================
-# 2. 數據下載與五相位狀態回放引擎
+# 2. 三階段即時數據下載與收盤價自動補齊引擎
 # ==========================================
 def safe_row_idxmax(df: pd.DataFrame, default_col: str) -> pd.Series:
     if df.empty:
@@ -92,11 +84,49 @@ def get_monthly_data(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[month_end_dates.values]
 
 
-def download_recent_market_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    all_tickers = TRADE_ETFS_3X + PROTO_ETFS_1X + SAFE_POOL
+def extract_close_open_from_yf(raw: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    closes = pd.DataFrame(index=raw.index)
+    opens = pd.DataFrame(index=raw.index)
+    if raw is None or raw.empty:
+        return closes, opens
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = set(raw.columns.get_level_values(0))
+        lvl1 = set(raw.columns.get_level_values(1))
+        for t in tickers:
+            if t in lvl0:
+                t_df = raw[t]
+                if "Close" in t_df.columns:
+                    closes[t] = pd.to_numeric(t_df["Close"], errors="coerce")
+                elif "Price" in t_df.columns:
+                    closes[t] = pd.to_numeric(t_df["Price"], errors="coerce")
+                if "Open" in t_df.columns:
+                    opens[t] = pd.to_numeric(t_df["Open"], errors="coerce")
+                elif t in closes.columns:
+                    opens[t] = closes[t]
+            elif t in lvl1:
+                if ("Close", t) in raw.columns:
+                    closes[t] = pd.to_numeric(raw[("Close", t)], errors="coerce")
+                if ("Open", t) in raw.columns:
+                    opens[t] = pd.to_numeric(raw[("Open", t)], errors="coerce")
+                elif t in closes.columns:
+                    opens[t] = closes[t]
+    else:
+        for t in tickers:
+            if t in raw.columns:
+                closes[t] = pd.to_numeric(raw[t], errors="coerce")
+                opens[t] = closes[t]
+    return closes, opens
+
+
+def download_recent_market_data() -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    tz_ny = pytz.timezone("America/New_York")
+    end_tomorrow = (datetime.now(tz_ny) + timedelta(days=2)).strftime("%Y-%m-%d")
+
+    # Stage 1: 下載 2018-01-01 至今之日 K 歷史序列 (明確傳入未來 end 日期避免截斷)
     raw = yf.download(
-        all_tickers,
+        CORE_LIVE_ETFS,
         start=DATA_START_DATE,
+        end=end_tomorrow,
         interval="1d",
         auto_adjust=True,
         progress=False,
@@ -106,33 +136,87 @@ def download_recent_market_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     if raw.empty:
         raise RuntimeError("Yahoo Finance 回傳空資料，請稍後再試。")
 
-    closes = pd.DataFrame(index=raw.index)
-    opens = pd.DataFrame(index=raw.index)
-
-    if isinstance(raw.columns, pd.MultiIndex):
-        lvl0 = set(raw.columns.get_level_values(0))
-        for t in all_tickers:
-            if t in lvl0:
-                t_df = raw[t]
-                closes[t] = pd.to_numeric(t_df.get("Close", t_df.get("Price")), errors="coerce")
-                opens[t] = pd.to_numeric(t_df.get("Open", closes[t]), errors="coerce")
-            elif ("Close", t) in raw.columns:
-                closes[t] = pd.to_numeric(raw[("Close", t)], errors="coerce")
-                opens[t] = pd.to_numeric(raw.get(("Open", t), closes[t]), errors="coerce")
-    else:
-        for t in all_tickers:
-            if t in raw.columns:
-                closes[t] = pd.to_numeric(raw[t], errors="coerce")
-                opens[t] = closes[t]
-
+    closes, opens = extract_close_open_from_yf(raw, CORE_LIVE_ETFS)
     if closes.index.tz is not None:
         closes.index = closes.index.tz_localize(None)
         opens.index = opens.index.tz_localize(None)
 
     valid_spy = closes["SPY"].dropna().index
-    closes = closes.loc[valid_spy].ffill().bfill()
-    opens = opens.loc[valid_spy].fillna(closes).ffill().bfill()
-    return closes, opens
+    closes = closes.loc[valid_spy].copy()
+    opens = opens.loc[valid_spy].fillna(closes).copy()
+    patch_note = "標準日K (1d)"
+
+    # Stage 2: 單獨抓取 period='5d', interval='1d' 繞過長天期歷史 CDN 快取延遲
+    try:
+        raw_5d = yf.download(
+            CORE_LIVE_ETFS,
+            period="5d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            group_by="ticker",
+        )
+        c_5d, o_5d = extract_close_open_from_yf(raw_5d, CORE_LIVE_ETFS)
+        if not c_5d.empty and "SPY" in c_5d.columns:
+            if c_5d.index.tz is not None:
+                c_5d.index = c_5d.index.tz_localize(None)
+                o_5d.index = o_5d.index.tz_localize(None)
+            c_5d = c_5d.loc[c_5d["SPY"].dropna().index]
+            for dt in c_5d.index:
+                for t in CORE_LIVE_ETFS:
+                    if t in c_5d.columns and pd.notna(c_5d.loc[dt, t]):
+                        closes.loc[dt, t] = float(c_5d.loc[dt, t])
+                    if t in o_5d.columns and pd.notna(o_5d.loc[dt, t]):
+                        opens.loc[dt, t] = float(o_5d.loc[dt, t])
+            closes = closes.sort_index()
+            opens = opens.sort_index()
+    except Exception:
+        pass
+
+    # Stage 3: 若美股剛收盤數小時內 Yahoo 1d 日表尚未寫入當日數據，自動由正規盤 15m K 線合成當日 Open / Close
+    try:
+        raw_15m = yf.download(
+            CORE_LIVE_ETFS,
+            period="5d",
+            interval="15m",
+            prepost=False,
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+            group_by="ticker",
+        )
+        c_15m, o_15m = extract_close_open_from_yf(raw_15m, CORE_LIVE_ETFS)
+        if not c_15m.empty and "SPY" in c_15m.columns:
+            if c_15m.index.tz is None:
+                c_15m.index = c_15m.index.tz_localize("UTC").tz_convert(tz_ny)
+                o_15m.index = o_15m.index.tz_localize("UTC").tz_convert(tz_ny)
+            else:
+                c_15m.index = c_15m.index.tz_convert(tz_ny)
+                o_15m.index = o_15m.index.tz_convert(tz_ny)
+
+            c_15m = c_15m.loc[c_15m["SPY"].dropna().index]
+            o_15m = o_15m.reindex(c_15m.index)
+
+            for d_val, grp_c in c_15m.groupby(c_15m.index.date):
+                ts_day = pd.Timestamp(d_val)
+                last_bar_tm = grp_c.index[-1]
+                is_session_closed = (last_bar_tm.hour > 15) or (last_bar_tm.hour == 15 and last_bar_tm.minute >= 45)
+                if is_session_closed and (ts_day not in closes.index):
+                    grp_o = o_15m.loc[grp_c.index]
+                    for t in CORE_LIVE_ETFS:
+                        s_c = grp_c[t].dropna() if t in grp_c.columns else pd.Series(dtype=float)
+                        s_o = grp_o[t].dropna() if t in grp_o.columns else pd.Series(dtype=float)
+                        if not s_c.empty:
+                            closes.loc[ts_day, t] = float(s_c.iloc[-1])
+                            opens.loc[ts_day, t] = float(s_o.iloc[0]) if not s_o.empty else float(s_c.iloc[0])
+                    patch_note = f"盤後 15m 即時合成日K (已補齊 {ts_day.strftime('%Y-%m-%d')} 收盤價)"
+            closes = closes.sort_index()
+            opens = opens.sort_index()
+    except Exception:
+        pass
+
+    return closes.ffill().bfill(), opens.ffill().bfill(), patch_note
 
 
 def run_q_state_machine_1d(vol_arr: np.ndarray, med_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -174,7 +258,9 @@ def run_q_state_machine_1d(vol_arr: np.ndarray, med_arr: np.ndarray) -> tuple[np
     return q_out, a_out
 
 
-def evaluate_latest_reband_state(closes: pd.DataFrame, opens: pd.DataFrame, account_nav: float = 100000.0) -> dict:
+def evaluate_latest_reband_state(
+    closes: pd.DataFrame, opens: pd.DataFrame, patch_note: str = "標準日K (1d)", account_nav: float = 100000.0
+) -> dict:
     prices_1x = closes[PROTO_ETFS_1X].dropna(how="all")
     monthly_1x = get_monthly_data(prices_1x)
     ret_1x_daily = (prices_1x / prices_1x.shift(1)) - 1.0
@@ -202,7 +288,6 @@ def evaluate_latest_reband_state(closes: pd.DataFrame, opens: pd.DataFrame, acco
         safe_seg_scores.append(r_seg_s / (safe_monthly_vol_252 + 1e-6))
     safe_comp = sum(safe_seg_scores) / float(len(MOM_SEGMENTS))
 
-    # 判斷最新收盤日是否為當月最後一個交易日（若下一個日曆日或當前台灣日期已跨月，或距月底 <= 0 天）
     last_date = closes.index[-1]
     next_bday = last_date + pd.tseries.offsets.BDay(1)
     is_month_end_session = (next_bday.month != last_date.month)
@@ -441,6 +526,7 @@ def evaluate_latest_reband_state(closes: pd.DataFrame, opens: pd.DataFrame, acco
 
     return {
         "signal_close_date": last_date.strftime("%Y-%m-%d"),
+        "patch_source_note": patch_note,
         "monthly_lock_date": ref_date.strftime("%Y-%m-%d"),
         "is_month_end_session": bool(is_month_end_session),
         "winner_3x": winner_now,
@@ -464,6 +550,7 @@ def format_notification_messages(report: dict, account_nav: float) -> tuple[str,
     w3x = report["winner_3x"]
     sf = report["safe_win"]
     has_chg = report["has_change"]
+    src_note = report.get("patch_source_note", "標準日K (1d)")
 
     if has_chg:
         subject = f"🚨 [REBAND 調倉通知] {sig_dt} 收盤觸發變動！目標: {report['agg_planned_weights_pct'][w3x]:.1f}% {w3x} / {report['agg_planned_weights_pct'][sf]:.1f}% {sf}"
@@ -485,7 +572,8 @@ def format_notification_messages(report: dict, account_nav: float) -> tuple[str,
     text_body = (
         f"{subject}\n"
         f"==================================================\n"
-        f"📅 最新美股收盤日: {sig_dt} (月度訊號鎖定日: {report['monthly_lock_date']})\n"
+        f"📅 最新美股收盤日: {sig_dt} ({src_note})\n"
+        f"🗓️ 月度訊號鎖定日: {report['monthly_lock_date']}\n"
         f"🎯 當前進攻贏家: {w3x} ({report['winner_1x']}) ｜ 當前避險贏家: {sf}\n"
         f"💰 預設帳戶總淨值: ${account_nav:,.0f} USD\n\n"
         f"【變動觸發摘要】\n{events_str}\n\n"
@@ -499,7 +587,6 @@ def format_notification_messages(report: dict, account_nav: float) -> tuple[str,
             f"偏離={r['Drift_bps']:.1f}bps -> Action={r['Action_Code']} ({r['Reasons']})\n"
         )
 
-    # HTML 郵件內容
     order_rows_html = ""
     for o in report["orders"]:
         bg = "#fff3cd" if not o["Command"].startswith("HOLD") else "#ffffff"
@@ -537,7 +624,7 @@ def format_notification_messages(report: dict, account_nav: float) -> tuple[str,
     <html><body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #212529;">
       <h2 style="color: {'#d9534f' if has_chg else '#28a745'};">{subject}</h2>
       <p>
-        📅 <b>最新美股收盤日</b>: <code>{sig_dt}</code> ｜
+        📅 <b>最新美股收盤日</b>: <code>{sig_dt}</code> ({src_note}) ｜
         <b>月度訊號鎖定日</b>: <code>{report['monthly_lock_date']}</code> ｜
         <b>當前標的</b>: 進攻 <b>{w3x}</b> ({report['winner_1x']}) ＋ 避險 <b>{sf}</b>
       </p>
@@ -610,7 +697,6 @@ def send_email_notification(subject: str, text_body: str, html_body: str) -> boo
 
 def send_ios_bark_or_webhook(subject: str, text_body: str) -> bool:
     sent_any = False
-    # 1. Bark iOS 推播 (iPhone 最推薦：免費、免開 App 原生 APNs 鎖屏通知)
     bark_url = os.environ.get("BARK_URL", "").strip().rstrip("/")
     if bark_url:
         payload = json.dumps({
@@ -624,7 +710,6 @@ def send_ios_bark_or_webhook(subject: str, text_body: str) -> bool:
             print(f"✅ 已發送 iPhone Bark 原生推播 (HTTP {resp.status})")
             sent_any = True
 
-    # 2. Telegram Bot 推播
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if tg_token and tg_chat_id:
@@ -640,12 +725,12 @@ def send_ios_bark_or_webhook(subject: str, text_body: str) -> bool:
 
 def main() -> int:
     account_nav = float(os.environ.get("ACCOUNT_NAV", "100000"))
-    notify_only_on_change = os.environ.get("NOTIFY_ONLY_ON_CHANGE", "true").lower() == "true"
+    notify_only_on_change = os.environ.get("NOTIFY_ONLY_ON_CHANGE", "false").lower() == "true"
     force_send = os.environ.get("FORCE_SEND", "false").lower() == "true"
 
-    print("🚀 正在下載最新 ETF 報價並計算 REBAND_HF0_200_0 五相位狀態...")
-    closes, opens = download_recent_market_data()
-    report = evaluate_latest_reband_state(closes, opens, account_nav=account_nav)
+    print("🚀 正在下載最新 ETF 報價並執行三階段收盤價補齊與 REBAND_HF0_200_0 狀態回放...")
+    closes, opens, patch_note = download_recent_market_data()
+    report = evaluate_latest_reband_state(closes, opens, patch_note=patch_note, account_nav=account_nav)
 
     subject, text_body, html_body = format_notification_messages(report, account_nav=account_nav)
     print("\n" + text_body)
