@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import io
+import os
 import warnings
 
 import altair as alt
@@ -10,10 +12,10 @@ import streamlit as st
 import yfinance as yf
 
 # ==========================================
-# 0. 頁面設定與機構實盤規格 (REBAND_HF0_200_0 全功能旗艦部署版)
+# 0. 頁面設定與機構實盤規格 (REBAND_QONLY_200_0 無近似旗艦部署版)
 # ==========================================
 st.set_page_config(
-    page_title="REBAND_HF0_200_0 機構實盤下單與超長歷史量化回測系統",
+    page_title="REBAND_QONLY_200_0 機構實盤下單與無近似量化回測系統",
     layout="wide",
 )
 warnings.simplefilter(action="ignore")
@@ -39,7 +41,7 @@ st.markdown(
 )
 
 # ==========================================
-# 1. 凍結策略核心常數 (REBAND_HF0_200_0 & O 對照)
+# 1. 凍結策略核心常數 (REBAND_QONLY_200_0 — 已拔除冗餘內層 a)
 # ==========================================
 MAPPING = {"UPRO": "SPY", "EURL": "VGK", "EDC": "EEM"}
 REVERSE_MAPPING = {v: k for k, v in MAPPING.items()}
@@ -49,12 +51,12 @@ SAFE_POOL = ["GLD", "TLT"]
 ALL_EXEC_ASSETS = ["UPRO", "EURL", "EDC", "GLD", "TLT"]
 CORE_LIVE_ETFS = TRADE_ETFS_3X + PROTO_ETFS_1X + SAFE_POOL
 
-# 超長歷史 (1995~2005 ETF 上市前) 1x 指數/共同基金無縫代理映射
-LONG_HIST_PROXIES = {
-    "VGK": "VEURX",   # Vanguard European Stock Index Fund (1990上市)
-    "EEM": "VEIEX",   # Vanguard Emerging Markets Stock Index Fund (1994上市)
-    "TLT": "VUSTX",   # Vanguard Long-Term Treasury Fund (1986上市)
-    "GLD": "FSAGX",   # Fidelity Select Gold Portfolio / GC=F 黃金代理 (1990上市)
+# 嚴格無金礦股汙染代理：GLD 上市前(2000-08-30~2004-11-17) 改用 GC=F 黃金期貨，徹底禁用 FSAGX
+CLEAN_HIST_PROXIES = {
+    "VGK": "VEURX",   # Vanguard European Stock Index Fund
+    "EEM": "VEIEX",   # Vanguard Emerging Markets Stock Index Fund
+    "TLT": "VUSTX",   # Vanguard Long-Term Treasury Fund
+    "GLD": "GC=F",    # COMEX Gold Futures (取代原版誤用之 FSAGX 金礦股)
 }
 
 SMA_MONTHS = 6
@@ -65,35 +67,46 @@ PHASE_COUNT = 5
 # 進攻與避險統一採用四等分標準日曆季度 (0, 3, 6, 9, 12) / Vol252 零自由參數規格
 MOM_SEGMENTS = [(0, 3), (3, 6), (6, 9), (9, 12)]
 
-# REBAND_HF0_200_0 專屬凍結常數
-THETA_VOL_PCT = 41.0          # 常態波動率縮放門檻 41%
-VOL_SCALING_POWER = 2.0       # 平方反比縮放 a = min(1, (41/sigma)^2)
-RHO_EXIT = 2.50               # 初次/再次危機退出門檻 rho >= 2.5
+# REBAND_QONLY_200_0 凍結 4 參數外層危機峰值回落斷路器 Q (已拔除內層 a 之 41% 與 2.0)
+RHO_EXIT = 2.50               # 初次/再次危機退出門檻 rho >= 2.50
 RHO_REENTRY = 1.25            # 危機解除復歸門檻 rho <= 1.25
-PEAK_SIGMA_DROP = 0.40        # 退出期波動率自峰值回落 40% (即 <= 0.60 * peak) 復歸
-TROUGH_SIGMA_RISE = 0.25      # 復歸後波動率較活動期低點升 25% 且 rho >= 2.5 才再次退出
+PEAK_SIGMA_DROP = 0.40        # 退出期波動率自峰值回落 40% (<= 0.60 * peak) 復歸
+TROUGH_SIGMA_RISE = 0.25      # 復歸後波動率較活動期低點升 25% 且 rho >= 2.50 才再次退出
 BAND_TRIG_TH = 0.0200         # 200 bps (2.00%) 觸發門檻
 BAND_DEST_TH = 0.0000         # 0 bps (0.00%) 觸發後直接一步拉回基礎目標權重
 
-# 原版 O 對照常數
+# 公平舊版 O 對照常數
 O_EXIT_Q = 0.975
 O_ENTRY_Q = 0.900
 
 EXPECTED_DATA_START = pd.Timestamp("1995-01-03")
+GARCH_FIT_START_DATE = "2000-06-01"
+DEFAULT_GARCH_CACHE_FILE = "reband_exact_garch_5phase_cache.npz"
+
+# 事前固定之重大歷史危機視窗 (用於分頁 2 機構級避險三指標報表)
+CRISIS_WINDOWS = [
+    ("2002 網路泡沫末段", "2002-03-19", "2002-10-09"),
+    ("2008 全球金融海嘯", "2007-10-09", "2009-03-09"),
+    ("2011 歐債與美債降評", "2011-04-29", "2011-10-03"),
+    ("2018 Q4 鷹派急跌", "2018-09-20", "2018-12-24"),
+    ("2020 COVID 熔斷下跌段", "2020-02-19", "2020-03-23"),
+    ("2020 熔斷+V轉完整段", "2020-02-19", "2020-08-31"),
+    ("2022 暴力升息熊市", "2022-01-03", "2022-10-12"),
+    ("2025 關稅市場震盪", "2025-02-19", "2025-04-08"),
+]
+
+# 顯性時區初始化（絕不放入 @st.cache_data）
+TZ_TW = pytz.timezone("Asia/Taipei")
+TZ_NY = pytz.timezone("America/New_York")
+NOW_TW = datetime.now(TZ_TW)
+NOW_NY = datetime.now(TZ_NY)
 
 with st.sidebar:
     st.header("🔧 單一帳戶下單與回測設定")
-    try:
-        tz_tw = pytz.timezone("Asia/Taipei")
-        tz_ny = pytz.timezone("America/New_York")
-        now_tw = datetime.now(tz_tw)
-        now_ny = datetime.now(tz_ny)
-        st.info(
-            f"🇹🇼 台灣時間: {now_tw.strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"🇺🇸 美東時間: {now_ny.strftime('%Y-%m-%d %H:%M %Z')}"
-        )
-    except Exception as e:
-        st.error(f"時區錯誤: {e}")
+    st.info(
+        f"🇹🇼 台灣時間: {NOW_TW.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
+        f"🇺🇸 美東時間: {NOW_NY.strftime('%Y-%m-%d %H:%M %Z')}"
+    )
 
     ACCOUNT_NAV = st.number_input(
         "💰 單一帳戶總淨值 (USD)", min_value=1000.0, value=100000.0, step=5000.0
@@ -111,73 +124,38 @@ with st.sidebar:
     FORCE_EOM = st.checkbox(
         "⚠️ 執行月底強制結算",
         value=False,
-        help="僅在『當月最後一個交易日收盤後』勾選，強制系統立刻以最新收盤價結算次月訊號。",
+        help="僅在『美股當月最後一個交易日 16:00 EST 收盤後』勾選，強制系統立刻以最新已收盤價結算次月訊號。",
     )
-    if st.button("🗑️ 強制清除快取 (重抓最新報價)"):
+    if st.button("🗑️ 強制清除下載快取 (重抓最新報價)"):
         st.cache_data.clear()
+        for k in ["exact_garch_runtime_mem", "uploaded_garch_npz_bytes"]:
+            if k in st.session_state:
+                del st.session_state[k]
         st.rerun()
 
 
 # ==========================================
-# 2. 數據下載與三階段即時收盤補齊引擎 (解決 Yahoo 長天期快取延遲)
+# 2. 純數據下載 (I/O) 與 MultiIndex 扁平化引擎 (嚴格遵守快取紀律：僅純 I/O 使用 @st.cache_data)
 # ==========================================
-def safe_row_idxmax(df: pd.DataFrame, default_col: str) -> pd.Series:
-    """在任何 Pandas 版本下安全取得每列最大值欄位名稱（遇全 NaN 列自動回傳 default_col，絕不拋出 ValueError）。"""
-    if df.empty:
-        return pd.Series(dtype=object)
-    arr = np.nan_to_num(df.to_numpy(dtype=float), nan=-np.inf)
-    all_missing = np.all(arr == -np.inf, axis=1)
-    max_idx = np.argmax(arr, axis=1)
-    cols = np.asarray(df.columns, dtype=object)
-    chosen = cols[max_idx].copy()
-    chosen[all_missing] = default_col
-    return pd.Series(chosen, index=df.index, dtype=object)
-
-
-def get_monthly_data(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-    period_idx = df.index.to_period("M")
-    month_end_dates = df.index.to_series().groupby(period_idx).max()
-    return df.loc[month_end_dates.values]
-
-
-def splice_early_series(primary_s: pd.Series, proxy_s: pd.Series) -> pd.Series:
-    """用早期共同基金/指數日報酬率無縫往前銜接 ETF 上市前的歷史價格序列（嚴格保持 ETF 上市後價格 100% 原生不變）。"""
-    s = primary_s.copy()
-    first_valid = s.first_valid_index()
-    if first_valid is None or proxy_s is None or proxy_s.dropna().empty:
-        return s
-    early_idx = s.index[s.index < first_valid]
-    if len(early_idx) == 0:
-        return s
-    p_sub = proxy_s.reindex(s.index[: s.index.get_loc(first_valid) + 1]).ffill()
-    if p_sub.isna().all() or p_sub.loc[first_valid] == 0 or pd.isna(p_sub.loc[first_valid]):
-        return s
-    scale = float(s.loc[first_valid]) / float(p_sub.loc[first_valid])
-    s.loc[early_idx] = p_sub.loc[early_idx] * scale
-    return s
-
-
-def extract_close_open_from_yf(raw: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def extract_flat_close_open(raw: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """下載後立即將 yfinance MultiIndex 扁平化為單層索引之 closes 與 opens DataFrame。"""
     closes = pd.DataFrame(index=raw.index)
     opens = pd.DataFrame(index=raw.index)
     if raw is None or raw.empty:
         return closes, opens
+
     if isinstance(raw.columns, pd.MultiIndex):
         lvl0 = set(raw.columns.get_level_values(0))
         lvl1 = set(raw.columns.get_level_values(1))
         for t in tickers:
             if t in lvl0:
-                t_df = raw[t]
-                if "Close" in t_df.columns:
-                    closes[t] = pd.to_numeric(t_df["Close"], errors="coerce")
-                elif "Price" in t_df.columns:
-                    closes[t] = pd.to_numeric(t_df["Price"], errors="coerce")
-                if "Open" in t_df.columns:
-                    opens[t] = pd.to_numeric(t_df["Open"], errors="coerce")
+                sub = raw[t]
+                if "Close" in sub.columns:
+                    closes[t] = pd.to_numeric(sub["Close"], errors="coerce")
+                elif "Price" in sub.columns:
+                    closes[t] = pd.to_numeric(sub["Price"], errors="coerce")
+                if "Open" in sub.columns:
+                    opens[t] = pd.to_numeric(sub["Open"], errors="coerce")
                 elif t in closes.columns:
                     opens[t] = closes[t]
             elif t in lvl1:
@@ -195,19 +173,36 @@ def extract_close_open_from_yf(raw: pd.DataFrame, tickers: list[str]) -> tuple[p
     return closes, opens
 
 
-def patch_latest_us_session(
-    closes: pd.DataFrame, opens: pd.DataFrame, core_tickers: list[str]
-) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """三階段即時收盤補齊機制：
-    1. 針對 8 檔核心 ETF 單獨抓取 period='5d', interval='1d'，繞過 Yahoo 31 年長天期歷史 CDN 快取與共同基金結算延遲。
-    2. 若美股剛收盤數小時內 Yahoo 日 K (1d) 尚未滾動更新，自動抓取 period='5d', interval='15m' (prepost=False) 正規盤分鐘線，
-       只要當日 15:45 EST 收盤前最後一根 15m K 線已產生，立即合成當日精確 Open 與 Close 補入序列。
-    """
-    patch_note = "標準日K (1d)"
-    # Stage 2: 單獨針對 8 檔核心 ETF 抓取近 5 日 1d 報價 (不含共同基金)
+@st.cache_data(ttl=180, show_spinner="正在從 Yahoo Finance 下載長天期歷史復權報價 (單線程)...")
+def download_yf_history_io(all_tickers: tuple[str, ...], start_str: str, end_str: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """純 I/O：不包含任何 datetime.now() 或即時狀態判斷。"""
+    raw = yf.download(
+        list(all_tickers),
+        start=start_str,
+        end=end_str,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+        group_by="ticker",
+    )
+    if raw is None or raw.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    c_df, o_df = extract_flat_close_open(raw, list(all_tickers))
+    if c_df.index.tz is not None:
+        c_df.index = c_df.index.tz_localize(None)
+        o_df.index = o_df.index.tz_localize(None)
+    return c_df, o_df
+
+
+@st.cache_data(ttl=180, show_spinner="正在補齊近 5 日核心 ETF 即時日K與正規盤 15m 報價...")
+def download_yf_patch_io(core_tickers: tuple[str, ...]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """純 I/O：抓取近 5 日 1d 與 15m 正規盤報價，不包含任何 datetime.now() 判斷。"""
+    c_5d, o_5d = pd.DataFrame(), pd.DataFrame()
+    c_15m, o_15m = pd.DataFrame(), pd.DataFrame()
     try:
         raw_5d = yf.download(
-            core_tickers,
+            list(core_tickers),
             period="5d",
             interval="1d",
             auto_adjust=True,
@@ -215,28 +210,16 @@ def patch_latest_us_session(
             threads=False,
             group_by="ticker",
         )
-        c_5d, o_5d = extract_close_open_from_yf(raw_5d, core_tickers)
-        if not c_5d.empty and "SPY" in c_5d.columns:
-            if c_5d.index.tz is not None:
-                c_5d.index = c_5d.index.tz_localize(None)
-                o_5d.index = o_5d.index.tz_localize(None)
-            c_5d = c_5d.loc[c_5d["SPY"].dropna().index]
-            for dt in c_5d.index:
-                for t in core_tickers:
-                    if t in c_5d.columns and pd.notna(c_5d.loc[dt, t]):
-                        closes.loc[dt, t] = float(c_5d.loc[dt, t])
-                    if t in o_5d.columns and pd.notna(o_5d.loc[dt, t]):
-                        opens.loc[dt, t] = float(o_5d.loc[dt, t])
-            closes = closes.sort_index()
-            opens = opens.sort_index()
+        c_5d, o_5d = extract_flat_close_open(raw_5d, list(core_tickers))
+        if not c_5d.empty and c_5d.index.tz is not None:
+            c_5d.index = c_5d.index.tz_localize(None)
+            o_5d.index = o_5d.index.tz_localize(None)
     except Exception:
         pass
 
-    # Stage 3: 檢查正规盤 15m K 線是否有尚未寫入 1d 日表的最新已收盤交易日
     try:
-        tz_ny = pytz.timezone("America/New_York")
         raw_15m = yf.download(
-            core_tickers,
+            list(core_tickers),
             period="5d",
             interval="15m",
             prepost=False,
@@ -245,183 +228,251 @@ def patch_latest_us_session(
             threads=False,
             group_by="ticker",
         )
-        c_15m, o_15m = extract_close_open_from_yf(raw_15m, core_tickers)
-        if not c_15m.empty and "SPY" in c_15m.columns:
-            if c_15m.index.tz is None:
-                c_15m.index = c_15m.index.tz_localize("UTC").tz_convert(tz_ny)
-                o_15m.index = o_15m.index.tz_localize("UTC").tz_convert(tz_ny)
-            else:
-                c_15m.index = c_15m.index.tz_convert(tz_ny)
-                o_15m.index = o_15m.index.tz_convert(tz_ny)
-
-            c_15m = c_15m.loc[c_15m["SPY"].dropna().index]
-            o_15m = o_15m.reindex(c_15m.index)
-
-            for d_val, grp_c in c_15m.groupby(c_15m.index.date):
-                ts_day = pd.Timestamp(d_val)
-                last_bar_tm = grp_c.index[-1]
-                # 確認該交易日已收盤 (最後一根 15m K 線時間 >= 15:45 美東時間)
-                is_session_closed = (last_bar_tm.hour > 15) or (last_bar_tm.hour == 15 and last_bar_tm.minute >= 45)
-                if is_session_closed and (ts_day not in closes.index):
-                    grp_o = o_15m.loc[grp_c.index]
-                    for t in core_tickers:
-                        s_c = grp_c[t].dropna() if t in grp_c.columns else pd.Series(dtype=float)
-                        s_o = grp_o[t].dropna() if t in grp_o.columns else pd.Series(dtype=float)
-                        if not s_c.empty:
-                            closes.loc[ts_day, t] = float(s_c.iloc[-1])
-                            opens.loc[ts_day, t] = float(s_o.iloc[0]) if not s_o.empty else float(s_c.iloc[0])
-                    patch_note = f"盤後 15m 即時合成日K (已補齊 {ts_day.strftime('%Y-%m-%d')} 收盤價)"
-            closes = closes.sort_index()
-            opens = opens.sort_index()
+        c_15m, o_15m = extract_flat_close_open(raw_15m, list(core_tickers))
     except Exception:
         pass
 
-    return closes.ffill().bfill(), opens.ffill().bfill(), patch_note
+    return c_5d, o_5d, c_15m, o_15m
 
 
-@st.cache_data(ttl=180, show_spinner="正在從 Yahoo Finance 下載全球 ETF 與最新美股收盤數據 (1995–至今)...")
-def get_live_market_bundle():
-    proxy_tickers = list(LONG_HIST_PROXIES.values()) + ["^IRX"]
-    all_tickers = CORE_LIVE_ETFS + proxy_tickers
-    end_tomorrow = (datetime.now(pytz.timezone("America/New_York")) + timedelta(days=2)).strftime("%Y-%m-%d")
-    try:
-        raw = yf.download(
-            all_tickers,
-            start=EXPECTED_DATA_START.strftime("%Y-%m-%d"),
-            end=end_tomorrow,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-            group_by="ticker",
-        )
-        if raw.empty:
-            return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float), "無資料"
+def splice_early_series_causal(primary_s: pd.Series, proxy_s: pd.Series) -> pd.Series:
+    """嚴格因果銜接：僅在 primary 上市前且 proxy 已有效之區間銜接，絕不使用 .bfill()。"""
+    s = primary_s.copy()
+    first_valid = s.first_valid_index()
+    if first_valid is None or proxy_s is None or proxy_s.dropna().empty:
+        return s
 
-        closes_raw, opens_raw = extract_close_open_from_yf(raw, all_tickers)
+    s.loc[first_valid:] = s.loc[first_valid:].ffill()
+    early_idx = s.index[s.index < first_valid]
+    if len(early_idx) == 0:
+        return s
 
-        if closes_raw.index.tz is not None:
-            closes_raw.index = closes_raw.index.tz_localize(None)
-            opens_raw.index = opens_raw.index.tz_localize(None)
+    proxy_first = proxy_s.first_valid_index()
+    if proxy_first is None or proxy_first >= first_valid:
+        return s
 
-        # 以 SPY 有效交易日為主軸
-        if "SPY" in closes_raw.columns:
-            valid_spy = closes_raw["SPY"].dropna().index
-            closes_raw = closes_raw.loc[valid_spy]
-            opens_raw = opens_raw.loc[valid_spy]
+    p_sub = proxy_s.reindex(s.index[: s.index.get_loc(first_valid) + 1]).copy()
+    p_sub.loc[proxy_first:] = p_sub.loc[proxy_first:].ffill()
 
-        # 處理無風險利率 ^IRX (年化百分比 -> 小數，例如 4.5 -> 0.045)
-        if "^IRX" in closes_raw.columns:
-            rf_ann = (closes_raw["^IRX"].ffill().bfill() / 100.0).clip(lower=0.0, upper=0.15)
+    anchor_p = p_sub.loc[first_valid]
+    anchor_s = s.loc[first_valid]
+    if pd.isna(anchor_p) or anchor_p == 0 or pd.isna(anchor_s):
+        return s
+
+    scale = float(anchor_s) / float(anchor_p)
+    valid_early = p_sub.loc[early_idx].dropna().index
+    s.loc[valid_early] = p_sub.loc[valid_early] * scale
+    return s
+
+
+def build_clean_live_market_bundle(now_ny: datetime) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, str, bool]:
+    """
+    非快取即時組裝邏輯：
+    1. 呼叫純 I/O 下載歷史與近 5 日數據。
+    2. 嚴格執行美東收盤防呆（美東未滿 16:00 自動剔除當日盤中未收盤 K 線）。
+    3. 全程禁止 .bfill()，並以 GC=F 取代 FSAGX。
+    """
+    proxy_tickers = list(CLEAN_HIST_PROXIES.values()) + ["^IRX"]
+    all_tickers = tuple(CORE_LIVE_ETFS + proxy_tickers)
+    end_tomorrow_ny = (now_ny + timedelta(days=2)).strftime("%Y-%m-%d")
+
+    closes_raw, opens_raw = download_yf_history_io(
+        all_tickers, EXPECTED_DATA_START.strftime("%Y-%m-%d"), end_tomorrow_ny
+    )
+    if closes_raw.empty or "SPY" not in closes_raw.columns:
+        return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float), "下載失敗", False
+
+    valid_spy = closes_raw["SPY"].dropna().index
+    closes_raw = closes_raw.loc[valid_spy].sort_index()
+    opens_raw = opens_raw.reindex(valid_spy).sort_index()
+
+    # 無風險利率 ^IRX (僅 ffill，早於首筆有效值才設常數 2.5%，不向後偷看)
+    if "^IRX" in closes_raw.columns:
+        rf_ann = (closes_raw["^IRX"].ffill().fillna(2.5) / 100.0).clip(lower=0.0, upper=0.15)
+    else:
+        rf_ann = pd.Series(0.025, index=closes_raw.index)
+
+    closes = pd.DataFrame(index=closes_raw.index)
+    opens = pd.DataFrame(index=closes_raw.index)
+    closes["SPY"] = closes_raw["SPY"].ffill()
+    opens["SPY"] = opens_raw["SPY"].combine_first(closes["SPY"].shift(1)).combine_first(closes["SPY"])
+
+    # 1x 資產嚴格因果銜接 (含 GLD <- GC=F)
+    for etf_1x, proxy_t in CLEAN_HIST_PROXIES.items():
+        c_s = closes_raw[etf_1x] if etf_1x in closes_raw.columns else pd.Series(np.nan, index=closes_raw.index)
+        o_s = opens_raw[etf_1x] if etf_1x in opens_raw.columns else pd.Series(np.nan, index=closes_raw.index)
+        p_c = closes_raw[proxy_t] if proxy_t in closes_raw.columns else None
+
+        c_spliced = splice_early_series_causal(c_s, p_c)
+        closes[etf_1x] = c_spliced
+
+        first_etf_dt = c_s.first_valid_index()
+        o_full = c_spliced.shift(1)
+        if first_etf_dt is not None:
+            o_live = o_s.loc[first_etf_dt:].combine_first(c_spliced.shift(1).loc[first_etf_dt:])
+            o_full.loc[first_etf_dt:] = o_live
+        opens[etf_1x] = o_full
+
+    # 3x ETF 嚴格因果合成 (上市後 100% 真實 ETF Open/Close)
+    for t3x, proto_1x in MAPPING.items():
+        c3 = closes_raw[t3x] if t3x in closes_raw.columns else pd.Series(np.nan, index=closes_raw.index)
+        o3 = opens_raw[t3x] if t3x in opens_raw.columns else pd.Series(np.nan, index=closes_raw.index)
+        first_3x = c3.first_valid_index()
+
+        r_1x = (closes[proto_1x] / closes[proto_1x].shift(1)) - 1.0
+        daily_drag = (0.0095 + 2.0 * (rf_ann.shift(1).fillna(0.025) + 0.01)) / 252.0
+        synth_r3 = (3.0 * r_1x - daily_drag).clip(lower=-0.95)
+        valid_r_idx = synth_r3.dropna().index
+        synth_p3 = pd.Series(np.nan, index=closes_raw.index)
+        if len(valid_r_idx) > 0:
+            synth_p3.loc[valid_r_idx] = 100.0 * np.cumprod(1.0 + synth_r3.loc[valid_r_idx].to_numpy(dtype=float))
+
+        c3_full = splice_early_series_causal(c3, synth_p3)
+        o3_full = c3_full.shift(1)
+        if first_3x is not None:
+            o3_live = o3.loc[first_3x:].combine_first(c3_full.shift(1).loc[first_3x:])
+            o3_full.loc[first_3x:] = o3_live
+        closes[t3x] = c3_full
+        opens[t3x] = o3_full
+
+    # 三階段盤後即時收盤補齊 (嚴格檢查美東收盤狀態)
+    patch_note = "標準日K (1d)"
+    c_5d, o_5d, c_15m, o_15m = download_yf_patch_io(tuple(CORE_LIVE_ETFS))
+    today_ny_ts = pd.Timestamp(now_ny.date())
+    is_us_open_intraday = (now_ny.weekday() < 5) and (now_ny.hour < 16)
+
+    if not c_5d.empty and "SPY" in c_5d.columns:
+        c_5d = c_5d.loc[c_5d["SPY"].dropna().index]
+        for dt in c_5d.index:
+            if is_us_open_intraday and (dt >= today_ny_ts):
+                continue
+            for t in CORE_LIVE_ETFS:
+                if t in c_5d.columns and pd.notna(c_5d.loc[dt, t]):
+                    closes.loc[dt, t] = float(c_5d.loc[dt, t])
+                if t in o_5d.columns and pd.notna(o_5d.loc[dt, t]):
+                    opens.loc[dt, t] = float(o_5d.loc[dt, t])
+        closes = closes.sort_index()
+        opens = opens.sort_index()
+
+    if not c_15m.empty and "SPY" in c_15m.columns:
+        if c_15m.index.tz is None:
+            c_15m.index = c_15m.index.tz_localize("UTC").tz_convert(TZ_NY)
+            o_15m.index = o_15m.index.tz_localize("UTC").tz_convert(TZ_NY)
         else:
-            rf_ann = pd.Series(0.025, index=closes_raw.index)
+            c_15m.index = c_15m.index.tz_convert(TZ_NY)
+            o_15m.index = o_15m.index.tz_convert(TZ_NY)
 
-        # 建立完整 1x 與 3x 序列 (ETF 上市後 100% 使用真實 ETF；ETF 上市前以代理基金與合成 3x TRS 銜接)
-        closes = pd.DataFrame(index=closes_raw.index)
-        opens = pd.DataFrame(index=closes_raw.index)
+        c_15m = c_15m.loc[c_15m["SPY"].dropna().index]
+        o_15m = o_15m.reindex(c_15m.index)
+        for d_val, grp_c in c_15m.groupby(c_15m.index.date):
+            ts_day = pd.Timestamp(d_val)
+            if is_us_open_intraday and (ts_day >= today_ny_ts):
+                continue
+            last_bar_tm = grp_c.index[-1]
+            is_session_closed = (last_bar_tm.hour > 15) or (last_bar_tm.hour == 15 and last_bar_tm.minute >= 45)
+            if is_session_closed and (ts_day not in closes.index):
+                grp_o = o_15m.loc[grp_c.index]
+                for t in CORE_LIVE_ETFS:
+                    s_c = grp_c[t].dropna() if t in grp_c.columns else pd.Series(dtype=float)
+                    s_o = grp_o[t].dropna() if t in grp_o.columns else pd.Series(dtype=float)
+                    if not s_c.empty:
+                        closes.loc[ts_day, t] = float(s_c.iloc[-1])
+                        opens.loc[ts_day, t] = float(s_o.iloc[0]) if not s_o.empty else float(s_c.iloc[0])
+                patch_note = f"盤後 15m 即時合成日K (已補齊 {ts_day.strftime('%Y-%m-%d')} 收盤價)"
+        closes = closes.sort_index()
+        opens = opens.sort_index()
 
-        closes["SPY"] = closes_raw["SPY"].ffill()
-        opens["SPY"] = opens_raw["SPY"].fillna(closes["SPY"]).ffill()
+    # 美東盤中防呆：若歷史 1d 序列本身夾帶尚未收盤之當日盤中 K 線，嚴格剔除
+    dropped_unclosed = False
+    if is_us_open_intraday and (closes.index[-1] >= today_ny_ts):
+        closes = closes.loc[closes.index < today_ny_ts]
+        opens = opens.loc[opens.index < today_ny_ts]
+        dropped_unclosed = True
+        patch_note += " ｜ 已自動排除美股未收盤之盤中報價"
 
-        for etf_1x, proxy_t in LONG_HIST_PROXIES.items():
-            c_s = closes_raw[etf_1x] if etf_1x in closes_raw.columns else pd.Series(np.nan, index=closes_raw.index)
-            o_s = opens_raw[etf_1x] if etf_1x in opens_raw.columns else c_s.copy()
-            p_c = closes_raw[proxy_t] if proxy_t in closes_raw.columns else None
-            closes[etf_1x] = splice_early_series(c_s.ffill(), p_c).ffill()
-            first_etf_dt = c_s.first_valid_index()
-            o_spliced = closes[etf_1x].shift(1).bfill()
-            if first_etf_dt is not None:
-                o_spliced.loc[o_spliced.index >= first_etf_dt] = o_s.loc[o_s.index >= first_etf_dt].fillna(
-                    closes[etf_1x].shift(1).loc[o_s.index >= first_etf_dt]
-                )
-            opens[etf_1x] = o_spliced.ffill()
+    # 嚴格僅向後 ffill (絕不 bfill)
+    for col in closes.columns:
+        fv = closes[col].first_valid_index()
+        if fv is not None:
+            closes.loc[fv:, col] = closes.loc[fv:, col].ffill()
+        fvo = opens[col].first_valid_index()
+        if fvo is not None:
+            opens.loc[fvo:, col] = opens.loc[fvo:, col].ffill()
 
-        # 合成 3x ETF 早期序列 (UPRO/EURL/EDC 上市前：3x 1x日報酬 - 0.95%年管理費 - 2x(無風險利率+1%融資利差))
-        for t3x, proto_1x in MAPPING.items():
-            c3 = closes_raw[t3x] if t3x in closes_raw.columns else pd.Series(np.nan, index=closes_raw.index)
-            o3 = opens_raw[t3x] if t3x in opens_raw.columns else c3.copy()
-            first_3x = c3.first_valid_index()
-
-            r_1x = (closes[proto_1x] / closes[proto_1x].shift(1)) - 1.0
-            daily_drag = (0.0095 + 2.0 * (rf_ann.shift(1).fillna(0.025) + 0.01)) / 252.0
-            synth_r3 = (3.0 * r_1x - daily_drag).fillna(0.0).clip(lower=-0.95)
-            synth_p3 = pd.Series(100.0 * np.cumprod(1.0 + synth_r3.to_numpy(dtype=float)), index=closes_raw.index)
-
-            c3_full = splice_early_series(c3.ffill(), synth_p3).ffill()
-            o3_full = c3_full.shift(1).bfill()
-            if first_3x is not None:
-                o3_full.loc[o3_full.index >= first_3x] = o3.loc[o3.index >= first_3x].fillna(
-                    c3_full.shift(1).loc[o3.index >= first_3x]
-                )
-            closes[t3x] = c3_full
-            opens[t3x] = o3_full
-
-        # 關鍵升級：執行三階段即時收盤補齊 (繞過長天期快取延遲，確保美股剛收盤立即納入當日最新數據)
-        closes, opens, patch_note = patch_latest_us_session(closes, opens, CORE_LIVE_ETFS)
-        rf_ann = rf_ann.reindex(closes.index).ffill().bfill()
-        return closes, opens, rf_ann, patch_note
-    except Exception as e:
-        st.error(f"數據下載失敗: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.Series(dtype=float), "下載失敗"
+    rf_ann = rf_ann.reindex(closes.index).ffill().fillna(0.025)
+    return closes, opens, rf_ann, patch_note, dropped_unclosed
 
 
 # ==========================================
-# 3. 月度動能排名 (進攻與避險統一採用四等分標準日曆季度 / Vol252) 與 SMA6
+# 3. 月度動能排名 (統一四等分標準日曆季度 / Vol252) 與 SMA6 (嚴格美東時區跨月)
 # ==========================================
-def calculate_monthly_signals_1x(closes: pd.DataFrame):
-    """嚴格使用 1x 原型 ETF 計算全歷史與當月四等分標準日曆季度 (0, 3, 6, 9, 12) / Vol252 動能與月度 SMA6。"""
+def get_confirmed_month_end_dates(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """僅保留已確認跨月完結之月底交易日，絕不提前鎖定未完結月份。"""
+    periods = idx.to_period("M")
+    is_eom = np.zeros(len(idx), dtype=bool)
+    is_eom[:-1] = periods[:-1] != periods[1:]
+    return idx[is_eom]
+
+
+def safe_row_idxmax_strict(df: pd.DataFrame) -> pd.Series:
+    """僅當該列所有欄位皆為有限值時輸出最大值欄名，否則維持 NaN（絕不盲填預設標的）。"""
+    out = pd.Series(index=df.index, dtype=object)
+    valid_mask = df.notna().all(axis=1)
+    if valid_mask.any():
+        sub = df.loc[valid_mask]
+        cols = np.asarray(sub.columns, dtype=object)
+        out.loc[valid_mask] = cols[np.argmax(sub.to_numpy(dtype=float), axis=1)]
+    return out
+
+
+def calculate_monthly_signals_1x(closes: pd.DataFrame, now_ny: datetime, force_eom: bool) -> dict:
+    """嚴格以美東時區判定已完結月份，並計算四等分標準日曆季度 (0,3,6,9,12)/Vol252 動能與月度 SMA6。"""
+    confirmed_eom = get_confirmed_month_end_dates(closes.index)
+    last_date = closes.index[-1]
+    last_data_period = last_date.to_period("M")
+    current_ny_period = pd.Period(now_ny.strftime("%Y-%m"), freq="M")
+
+    # 僅在「手動勾選月底強制結算」或「美東時間已正式跨入次月」時，才把最新收盤日納入已結算月底
+    is_last_month_locked = force_eom or (last_data_period < current_ny_period)
+    if is_last_month_locked and (len(confirmed_eom) == 0 or confirmed_eom[-1] != last_date):
+        effective_monthly_idx = confirmed_eom.append(pd.DatetimeIndex([last_date]))
+    else:
+        effective_monthly_idx = confirmed_eom
+
     # 1. 進攻端 1x 原型 (SPY, VGK, EEM)
-    prices_1x = closes[PROTO_ETFS_1X].dropna(how="all")
-    monthly_1x = get_monthly_data(prices_1x)
-    ret_1x_daily = (prices_1x / prices_1x.shift(1)) - 1.0
-    daily_vol_252 = ret_1x_daily.rolling(252).std(ddof=1) * np.sqrt(252.0)
-    monthly_vol_252 = daily_vol_252.reindex(monthly_1x.index)
+    p_1x = closes[PROTO_ETFS_1X]
+    m_1x = p_1x.loc[effective_monthly_idx]
+    r_1x = (p_1x / p_1x.shift(1)) - 1.0
+    v_1x = (r_1x.rolling(252, min_periods=252).std(ddof=1) * np.sqrt(252.0)).reindex(effective_monthly_idx)
 
-    seg_scores = []
-    seg_rets = {}
-    for start_m, end_m in MOM_SEGMENTS:
-        if start_m == 0:
-            r_seg = (monthly_1x / monthly_1x.shift(end_m)) - 1.0
-        else:
-            r_seg = (monthly_1x.shift(start_m) / monthly_1x.shift(end_m)) - 1.0
-        seg_rets[(start_m, end_m)] = r_seg
-        seg_scores.append(r_seg / (monthly_vol_252 + 1e-6))
-
+    seg_scores, seg_rets = [], {}
+    for s_m, e_m in MOM_SEGMENTS:
+        r_seg = (m_1x / m_1x.shift(e_m) - 1.0) if s_m == 0 else (m_1x.shift(s_m) / m_1x.shift(e_m) - 1.0)
+        seg_rets[(s_m, e_m)] = r_seg
+        seg_scores.append(r_seg / (v_1x + 1e-12))
     total_score_df = sum(seg_scores) / float(len(MOM_SEGMENTS))
 
-    sma6_mean_df = monthly_1x.rolling(SMA_MONTHS).mean()
-    sma6_state_df = (monthly_1x > sma6_mean_df).astype(float)
+    sma6_mean_df = m_1x.rolling(SMA_MONTHS, min_periods=SMA_MONTHS).mean()
+    sma6_state_df = pd.DataFrame(
+        np.where(sma6_mean_df.notna(), (m_1x > sma6_mean_df).astype(float), np.nan),
+        index=effective_monthly_idx,
+        columns=PROTO_ETFS_1X,
+    )
 
-    # 2. 防禦端避險池 (GLD, TLT) — 同步採用四等分標準日曆季度 (0, 3, 6, 9, 12) / Vol252
-    prices_safe = closes[SAFE_POOL].dropna(how="all")
-    safe_monthly = get_monthly_data(prices_safe)
-    ret_safe_daily = (prices_safe / prices_safe.shift(1)) - 1.0
-    safe_daily_vol_252 = ret_safe_daily.rolling(252).std(ddof=1) * np.sqrt(252.0)
-    safe_monthly_vol_252 = safe_daily_vol_252.reindex(safe_monthly.index)
+    # 2. 防禦端避險池 (GLD, TLT)
+    p_safe = closes[SAFE_POOL]
+    m_safe = p_safe.loc[effective_monthly_idx]
+    r_safe = (p_safe / p_safe.shift(1)) - 1.0
+    v_safe = (r_safe.rolling(252, min_periods=252).std(ddof=1) * np.sqrt(252.0)).reindex(effective_monthly_idx)
 
-    safe_seg_scores = []
-    safe_seg_rets = {}
-    for start_m, end_m in MOM_SEGMENTS:
-        if start_m == 0:
-            r_seg_s = (safe_monthly / safe_monthly.shift(end_m)) - 1.0
-        else:
-            r_seg_s = (safe_monthly.shift(start_m) / safe_monthly.shift(end_m)) - 1.0
-        safe_seg_rets[(start_m, end_m)] = r_seg_s
-        safe_seg_scores.append(r_seg_s / (safe_monthly_vol_252 + 1e-6))
-
+    safe_seg_scores, safe_seg_rets = [], {}
+    for s_m, e_m in MOM_SEGMENTS:
+        r_seg_s = (m_safe / m_safe.shift(e_m) - 1.0) if s_m == 0 else (m_safe.shift(s_m) / m_safe.shift(e_m) - 1.0)
+        safe_seg_rets[(s_m, e_m)] = r_seg_s
+        safe_seg_scores.append(r_seg_s / (v_safe + 1e-12))
     safe_comp = sum(safe_seg_scores) / float(len(MOM_SEGMENTS))
 
-    last_date = closes.index[-1]
-    tz_tw = pytz.timezone("Asia/Taipei")
-    now_tw = datetime.now(tz_tw)
-    last_data_period = last_date.to_period("M")
-    current_tw_period = pd.Period(now_tw.strftime("%Y-%m"), freq="M")
-
-    if FORCE_EOM or (last_data_period < current_tw_period):
-        ref_date = monthly_1x.index[-1]
-    else:
-        prev_m = monthly_1x[monthly_1x.index.to_period("M") < last_data_period]
-        ref_date = prev_m.index[-1] if not prev_m.empty else monthly_1x.index[-1]
+    ref_date = effective_monthly_idx[-1]
 
     sel_rows = []
     for proto_t in PROTO_ETFS_1X:
@@ -429,10 +480,10 @@ def calculate_monthly_signals_1x(closes: pd.DataFrame):
         sel_rows.append({
             "Trade_ETF_3x": trade_3x,
             "Signal_Proto_1x": proto_t,
-            "Close_1x": float(monthly_1x.loc[ref_date, proto_t]),
+            "Close_1x": float(m_1x.loc[ref_date, proto_t]),
             "SMA6_1x": float(sma6_mean_df.loc[ref_date, proto_t]),
             "SMA6_State": int(sma6_state_df.loc[ref_date, proto_t]),
-            "Vol_252d_Ann": float(monthly_vol_252.loc[ref_date, proto_t]),
+            "Vol_252d_Ann": float(v_1x.loc[ref_date, proto_t]),
             "Ret_0to3M": float(seg_rets[(0, 3)].loc[ref_date, proto_t]),
             "Ret_3to6M": float(seg_rets[(3, 6)].loc[ref_date, proto_t]),
             "Ret_6to9M": float(seg_rets[(6, 9)].loc[ref_date, proto_t]),
@@ -445,8 +496,8 @@ def calculate_monthly_signals_1x(closes: pd.DataFrame):
     for s_t in SAFE_POOL:
         safe_rows.append({
             "Ticker": s_t,
-            "Close_1x": float(safe_monthly.loc[ref_date, s_t]),
-            "Vol_252d_Ann": float(safe_monthly_vol_252.loc[ref_date, s_t]),
+            "Close_1x": float(m_safe.loc[ref_date, s_t]),
+            "Vol_252d_Ann": float(v_safe.loc[ref_date, s_t]),
             "Ret_0to3M": float(safe_seg_rets[(0, 3)].loc[ref_date, s_t]),
             "Ret_3to6M": float(safe_seg_rets[(3, 6)].loc[ref_date, s_t]),
             "Ret_6to9M": float(safe_seg_rets[(6, 9)].loc[ref_date, s_t]),
@@ -456,40 +507,30 @@ def calculate_monthly_signals_1x(closes: pd.DataFrame):
     safe_df = pd.DataFrame(safe_rows).set_index("Ticker").sort_values("Total_Score", ascending=False)
     safe_win = str(safe_df.index[0])
 
-    effective_monthly_idx = (
-        monthly_1x.index if (FORCE_EOM or last_data_period < current_tw_period) else monthly_1x.index[:-1]
-    )
-    leader_1x_monthly = safe_row_idxmax(total_score_df.loc[effective_monthly_idx], default_col="SPY")
-    leader_3x_monthly = leader_1x_monthly.map(REVERSE_MAPPING)
-    safe_win_monthly = safe_row_idxmax(safe_comp.loc[effective_monthly_idx], default_col="GLD")
+    leader_1x_m = safe_row_idxmax_strict(total_score_df)
+    leader_3x_m = leader_1x_m.map(REVERSE_MAPPING)
+    safe_win_m = safe_row_idxmax_strict(safe_comp)
 
-    daily_leader_3x = leader_3x_monthly.reindex(closes.index).ffill().fillna("UPRO")
-    daily_safe_win = safe_win_monthly.reindex(closes.index).ffill().fillna("GLD")
-    daily_sma6_by_3x = (
-        sma6_state_df.loc[effective_monthly_idx]
-        .rename(columns=REVERSE_MAPPING)
-        .reindex(closes.index)
-        .ffill()
-        .fillna(1.0)
-    )
+    daily_leader_3x = leader_3x_m.reindex(closes.index).ffill()
+    daily_safe_win = safe_win_m.reindex(closes.index).ffill()
+    daily_sma6_by_3x = sma6_state_df.rename(columns=REVERSE_MAPPING).reindex(closes.index).ffill()
 
-    # 建立近 24 個月歷史輪動紀錄表
     hist_rot_rows = []
     for m_dt in effective_monthly_idx[-24:][::-1]:
-        l_1x = str(leader_1x_monthly.loc[m_dt])
-        l_3x = REVERSE_MAPPING.get(l_1x, "UPRO")
-        s_w = str(safe_win_monthly.loc[m_dt])
-        sma_st = int(sma6_state_df.loc[m_dt, l_1x]) if pd.notna(sma6_state_df.loc[m_dt, l_1x]) else 1
-        sc_val = float(total_score_df.loc[m_dt, l_1x]) if pd.notna(total_score_df.loc[m_dt, l_1x]) else np.nan
-        s_sc_val = float(safe_comp.loc[m_dt, s_w]) if pd.notna(safe_comp.loc[m_dt, s_w]) else np.nan
+        l_1x = leader_1x_m.loc[m_dt]
+        s_w = safe_win_m.loc[m_dt]
+        if pd.isna(l_1x) or pd.isna(s_w):
+            continue
+        l_1x_str, s_w_str = str(l_1x), str(s_w)
+        sma_st = int(sma6_state_df.loc[m_dt, l_1x_str])
         hist_rot_rows.append({
             "月底訊號鎖定日": m_dt.strftime("%Y-%m-%d"),
-            "勝出進攻原型 (1x)": l_1x,
-            "對應實盤槓桿 ETF (3x)": l_3x,
-            "進攻 4 季動能總分": round(sc_val, 3) if np.isfinite(sc_val) else np.nan,
+            "勝出進攻原型 (1x)": l_1x_str,
+            "對應實盤槓桿 ETF (3x)": REVERSE_MAPPING[l_1x_str],
+            "進攻 4 季動能總分": round(float(total_score_df.loc[m_dt, l_1x_str]), 3),
             "月度 SMA6 狀態": "多頭 (1)" if sma_st == 1 else "跌破均線 (0)",
-            "勝出避險資產 (1x)": s_w,
-            "避險 4 季動能總分": round(s_sc_val, 3) if np.isfinite(s_sc_val) else np.nan,
+            "勝出避險資產 (1x)": s_w_str,
+            "避險 4 季動能總分": round(float(safe_comp.loc[m_dt, s_w_str]), 3),
         })
 
     return {
@@ -505,24 +546,212 @@ def calculate_monthly_signals_1x(closes: pd.DataFrame):
 
 
 # ==========================================
-# 4. 五相位 GARCH + Q 狀態機 + a 縮放器 + 200/0 bps 實盤狀態自動回放引擎
+# 4. 無近似 5 相位 Student-t GARCH(1,1) 快取載入與即時增量補算引擎 (零假近似)
 # ==========================================
-def run_q_state_machine_1d(vol_arr: np.ndarray, med_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def fit_exact_garch_range(
+    ret_pct: np.ndarray,
+    vol_5ph: np.ndarray,
+    start_t: int,
+    end_t: int,
+    progress_cb=None,
+) -> np.ndarray:
+    """在 [start_t, end_t) 區間內執行真正的 504 日滾動 Student-t GARCH(1,1) MLE (絕不近似)。"""
+    last_vol = [np.nan] * PHASE_COUNT
+    if start_t > 0:
+        for ph in range(PHASE_COUNT):
+            v_prev = vol_5ph[ph, start_t - 1]
+            if np.isfinite(v_prev):
+                last_vol[ph] = float(v_prev)
+
+    total_steps = max(1, end_t - start_t)
+    for step_i, t in enumerate(range(start_t, end_t)):
+        due_ph = (t - GARCH_WINDOW) % PHASE_COUNT
+        train = ret_pct[t - GARCH_WINDOW + 1 : t + 1]
+        if len(train) == GARCH_WINDOW and np.all(np.isfinite(train)):
+            try:
+                am = arch_model(train, vol="Garch", p=1, q=1, dist="t", rescale=False)
+                res = am.fit(disp="off", show_warning=False)
+                fc = res.forecast(horizon=1, reindex=False)
+                v_ann = float(np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252.0))
+                if np.isfinite(v_ann) and v_ann > 0.0:
+                    last_vol[due_ph] = v_ann
+            except Exception:
+                pass
+        for ph in range(PHASE_COUNT):
+            vol_5ph[ph, t] = last_vol[ph]
+        if progress_cb is not None and (step_i % 100 == 0 or step_i == total_steps - 1):
+            progress_cb((step_i + 1) / total_steps)
+    return vol_5ph
+
+
+def serialize_exact_garch_cache(dates: pd.DatetimeIndex, vol_5ph: dict, fit_start_pos: int) -> bytes:
+    """匯出含完整日期索引之無近似 GARCH 標準 .npz 快取檔，供提交至 GitHub 根目錄實現秒開。"""
+    buf = io.BytesIO()
+    save_dict = {
+        "dates": np.asarray(dates.strftime("%Y-%m-%d"), dtype="U10"),
+        "last_dt": dates[-1].strftime("%Y-%m-%d"),
+        "n_total": len(dates),
+        "fit_start_pos": fit_start_pos,
+    }
+    for t3x in TRADE_ETFS_3X:
+        save_dict[f"vol_{t3x}"] = vol_5ph[t3x]
+    np.savez_compressed(buf, **save_dict)
+    return buf.getvalue()
+
+
+def try_load_exact_garch_from_npz(closes: pd.DataFrame, npz_source) -> tuple[dict | None, int, str]:
+    """支援新版(含 dates 索引)與舊版 Colab(last_dt/n_total)兩種 .npz 無近似快取格式，並自動補算最新交易日。"""
+    dates = closes.index
+    n_total = len(dates)
+    fit_start_pos = max(GARCH_WINDOW, int(dates.searchsorted(pd.Timestamp(GARCH_FIT_START_DATE))))
+
+    try:
+        npz = np.load(npz_source, allow_pickle=True)
+    except Exception as e:
+        return None, fit_start_pos, f"快取讀取失敗: {e}"
+
+    if not all(f"vol_{t3x}" in npz.files for t3x in TRADE_ETFS_3X):
+        return None, fit_start_pos, "快取檔缺少必要欄位"
+
+    vol_5ph = {t3x: np.full((PHASE_COUNT, n_total), np.nan, dtype=float) for t3x in TRADE_ETFS_3X}
+    last_aligned_pos = -1
+
+    if "dates" in npz.files:
+        cached_dts = pd.to_datetime(npz["dates"])
+        date_to_pos = {d: i for i, d in enumerate(dates)}
+        matched_pairs = [(c_i, date_to_pos[d]) for c_i, d in enumerate(cached_dts) if d in date_to_pos]
+        if len(matched_pairs) < 500:
+            return None, fit_start_pos, "快取日期與當前市場主軸重疊不足"
+        c_idx = np.array([p[0] for p in matched_pairs], dtype=int)
+        t_idx = np.array([p[1] for p in matched_pairs], dtype=int)
+        for t3x in TRADE_ETFS_3X:
+            vol_5ph[t3x][:, t_idx] = npz[f"vol_{t3x}"][:, c_idx]
+        last_aligned_pos = int(np.max(t_idx))
+        cache_mode_desc = f"標準日期索引快取 (對齊 {len(matched_pairs):,} 日)"
+    else:
+        # 相容舊版 Colab 快取格式 (last_dt, n_total, fit_start_pos)
+        c_last_dt = pd.Timestamp(str(npz["last_dt"]))
+        c_n = int(npz["n_total"])
+        if c_last_dt in dates:
+            pos_last = int(dates.get_loc(c_last_dt))
+            if pos_last + 1 == c_n:
+                for t3x in TRADE_ETFS_3X:
+                    vol_5ph[t3x][:, :c_n] = npz[f"vol_{t3x}"][:, :c_n]
+                last_aligned_pos = pos_last
+                cache_mode_desc = f"Colab 原生快取 (對齊至 {c_last_dt.strftime('%Y-%m-%d')})"
+            else:
+                return None, fit_start_pos, "舊版快取長度與 SPY 主軸不一致，請使用帶日期索引的新快取"
+        else:
+            return None, fit_start_pos, "舊版快取截止日不在當前市場索引中"
+
+    # 增量補算：永遠以真實 Student-t GARCH(1,1) 重算最後 5 日及所有新增交易日（確保尾端 100% 即時新鮮）
+    incr_start = max(fit_start_pos, last_aligned_pos - 4)
+    new_days_cnt = max(0, n_total - 1 - last_aligned_pos)
+    for t3x, proto_1x in MAPPING.items():
+        ret_pct = (((closes[proto_1x] / closes[proto_1x].shift(1)) - 1.0) * 100.0).to_numpy(dtype=float)
+        vol_5ph[t3x] = fit_exact_garch_range(ret_pct, vol_5ph[t3x], incr_start, n_total)
+
+    status_msg = f"100% 無近似 Student-t GARCH(1,1) ｜ {cache_mode_desc} ＋ 即時精確增量補算 {new_days_cnt} 個新交易日"
+    return vol_5ph, fit_start_pos, status_msg
+
+
+def get_exact_garch_5ph_for_session(closes: pd.DataFrame, build_full_now: bool = False) -> tuple[dict, bool, int, str]:
+    """
+    取得無近似 5 相位 Student-t GARCH(1,1) 序列：
+    - 優先載入 GitHub 根目錄或使用者上傳的 .npz 快取並做增量補算（全歷史 25 年完整就緒）。
+    - 若無快取且未要求全量重算，僅以真實 arch_model 精確計算近 1,136 天 (含 504 訓練 + 252 中位數 + 380 乾淨回放)，供分頁 1 實盤零偷工減料使用。
+    """
+    dates = closes.index
+    n_total = len(dates)
+    last_dt_str = dates[-1].strftime("%Y-%m-%d")
+    fit_start_pos = max(GARCH_WINDOW, int(dates.searchsorted(pd.Timestamp(GARCH_FIT_START_DATE))))
+
+    # 1. 檢查同 session 已計算完成之記憶體狀態（避免切換介面元件重複擬合）
+    mem = st.session_state.get("exact_garch_runtime_mem")
+    if (
+        mem is not None
+        and mem["last_dt"] == last_dt_str
+        and mem["n_total"] == n_total
+        and (mem["is_full"] or (not build_full_now))
+    ):
+        return mem["vol_5ph"], mem["is_full"], mem["fit_start_pos"], mem["status_msg"]
+
+    # 2. 優先嘗試載入使用者上傳或 GitHub 根目錄的無近似 .npz 快取檔
+    if not build_full_now:
+        npz_src = None
+        if "uploaded_garch_npz_bytes" in st.session_state:
+            npz_src = io.BytesIO(st.session_state["uploaded_garch_npz_bytes"])
+        elif os.path.exists(DEFAULT_GARCH_CACHE_FILE):
+            npz_src = DEFAULT_GARCH_CACHE_FILE
+
+        if npz_src is not None:
+            vol_5ph, f_pos, msg = try_load_exact_garch_from_npz(closes, npz_src)
+            if vol_5ph is not None:
+                st.session_state["exact_garch_runtime_mem"] = {
+                    "last_dt": last_dt_str,
+                    "n_total": n_total,
+                    "is_full": True,
+                    "fit_start_pos": f_pos,
+                    "vol_5ph": vol_5ph,
+                    "status_msg": msg,
+                }
+                return vol_5ph, True, f_pos, msg
+
+    # 3. 若使用者觸發全量重算（產出 2000–至今完整無近似序列）
+    if build_full_now:
+        vol_5ph = {t3x: np.full((PHASE_COUNT, n_total), np.nan, dtype=float) for t3x in TRADE_ETFS_3X}
+        prog = st.progress(0.0, text="正在執行全歷史 2000–至今無近似 5 相位 Student-t GARCH(1,1) MLE 擬合...")
+        for idx_a, (t3x, proto_1x) in enumerate(MAPPING.items()):
+            ret_pct = (((closes[proto_1x] / closes[proto_1x].shift(1)) - 1.0) * 100.0).to_numpy(dtype=float)
+
+            def _cb(frac, i_a=idx_a, name_a=t3x):
+                prog.progress((i_a + frac) / 3.0, text=f"無近似 GARCH 擬合中：{name_a} ({MAPPING[name_a]}) — {(i_a + frac)/3.0*100:.1f}%")
+
+            vol_5ph[t3x] = fit_exact_garch_range(ret_pct, vol_5ph[t3x], fit_start_pos, n_total, progress_cb=_cb)
+        prog.empty()
+        msg = f"100% 無近似 Student-t GARCH(1,1) ｜ 全歷史即時現算完成 ({dates[fit_start_pos].strftime('%Y-%m-%d')} ～ {last_dt_str})"
+        st.session_state["exact_garch_runtime_mem"] = {
+            "last_dt": last_dt_str,
+            "n_total": n_total,
+            "is_full": True,
+            "fit_start_pos": fit_start_pos,
+            "vol_5ph": vol_5ph,
+            "status_msg": msg,
+        }
+        return vol_5ph, True, fit_start_pos, msg
+
+    # 4. 無快取檔之預設實盤模式：嚴格無 .bfill() 精確計算近 1,136 天 (380 天乾淨狀態機回放)
+    live_fit_start = max(GARCH_WINDOW, n_total - (QUANTILE_WINDOW + 380))
+    vol_5ph = {t3x: np.full((PHASE_COUNT, n_total), np.nan, dtype=float) for t3x in TRADE_ETFS_3X}
+    with st.spinner("未偵測到全歷史 .npz 快取，正在為實盤分頁執行近 1.5 年無近似 Student-t GARCH(1,1) 精確擬合..."):
+        for t3x, proto_1x in MAPPING.items():
+            ret_pct = (((closes[proto_1x] / closes[proto_1x].shift(1)) - 1.0) * 100.0).to_numpy(dtype=float)
+            vol_5ph[t3x] = fit_exact_garch_range(ret_pct, vol_5ph[t3x], live_fit_start, n_total)
+    msg = f"實盤精確模式 (近 1.5 年無近似 Student-t GARCH，無 .bfill()) ｜ 尚未載入 25 年全歷史 .npz 快取"
+    st.session_state["exact_garch_runtime_mem"] = {
+        "last_dt": last_dt_str,
+        "n_total": n_total,
+        "is_full": False,
+        "fit_start_pos": live_fit_start,
+        "vol_5ph": vol_5ph,
+        "status_msg": msg,
+    }
+    return vol_5ph, False, live_fit_start, msg
+
+
+# ==========================================
+# 5. 統一單一真相引擎：Q 斷路器狀態機 ＋ 實盤狀態回放 ＋ 獨立子帳戶無近似回測
+# ==========================================
+def run_q_state_machine_strict(vol_arr: np.ndarray, med_arr: np.ndarray) -> np.ndarray:
+    """外層危機峰值回落斷路器 Q (嚴格無 .bfill()，資料未達 252 日暖機維持 NaN)。"""
     n = len(vol_arr)
-    q_out = np.ones(n, dtype=float)
-    a_out = np.ones(n, dtype=float)
+    q_out = np.full(n, np.nan, dtype=float)
     state = 1
     peak = 0.0
     trough = -1.0
     for t in range(n):
-        vt = vol_arr[t]
-        mt = med_arr[t]
-        if np.isfinite(vt) and vt > 0.0:
-            a_out[t] = min(1.0, (THETA_VOL_PCT / vt) ** VOL_SCALING_POWER)
-        else:
-            a_out[t] = 1.0
+        vt, mt = vol_arr[t], med_arr[t]
         if not (np.isfinite(vt) and np.isfinite(mt) and mt > 0.0):
-            q_out[t] = float(state)
             continue
         rho = vt / mt
         if state == 1:
@@ -543,478 +772,340 @@ def run_q_state_machine_1d(vol_arr: np.ndarray, med_arr: np.ndarray) -> tuple[np
                 state = 1
                 trough = vt
         q_out[t] = float(state)
-    return q_out, a_out
+    return q_out
 
 
-@st.cache_data(ttl=180, show_spinner="正在執行實盤 5 相位 Student-t GARCH(1,1) 與 REBAND 200/0 bps 狀態自動回放...")
-def run_5phase_live_reband_replay(
-    closes: pd.DataFrame, opens: pd.DataFrame, force_eom_flag: bool, last_dt_key: str
-):
-    """自動回放近期 5 相位 (Phase 0..4) 的精確 Student-t GARCH(1,1)、Q、a 與 200/0 bps 實際持倉漂移狀態。"""
-    m_sig = calculate_monthly_signals_1x(closes)
-    tail_n = GARCH_WINDOW + QUANTILE_WINDOW + 140
-    sub_closes = closes.tail(tail_n).copy()
-    sub_opens = opens.reindex(sub_closes.index).copy()
-    abs_indices = closes.index.get_indexer(sub_closes.index)
-    dates_sub = sub_closes.index
-
-    vol_5ph = {t3x: np.full((PHASE_COUNT, len(dates_sub)), np.nan) for t3x in TRADE_ETFS_3X}
-    q_5ph = {t3x: np.ones((PHASE_COUNT, len(dates_sub)), dtype=float) for t3x in TRADE_ETFS_3X}
-    a_5ph = {t3x: np.ones((PHASE_COUNT, len(dates_sub)), dtype=float) for t3x in TRADE_ETFS_3X}
-    med_5ph = {t3x: np.full((PHASE_COUNT, len(dates_sub)), np.nan) for t3x in TRADE_ETFS_3X}
-    g_o_5ph = {t3x: np.ones((PHASE_COUNT, len(dates_sub)), dtype=float) for t3x in TRADE_ETFS_3X}
-
-    active_3x_set = set(m_sig["daily_leader_3x"].tail(130).unique()) | {str(m_sig["sel_df"].index[0])}
-    for t3x, proto_1x in MAPPING.items():
-        if t3x not in active_3x_set:
-            continue
-        ret_pct = ((closes[proto_1x] / closes[proto_1x].shift(1)) - 1.0) * 100.0
-        ret_sub = ret_pct.reindex(dates_sub).to_numpy(dtype=float)
-        last_vol = [np.nan] * PHASE_COUNT
-        for idx_t in range(GARCH_WINDOW, len(dates_sub)):
-            abs_pos = int(abs_indices[idx_t])
-            due_ph = (abs_pos - GARCH_WINDOW) % PHASE_COUNT
-            train = ret_sub[idx_t - GARCH_WINDOW + 1 : idx_t + 1]
-            train = train[np.isfinite(train)]
-            if len(train) >= 250:
-                try:
-                    am = arch_model(train, vol="Garch", p=1, q=1, dist="t", rescale=False)
-                    res = am.fit(disp="off", show_warning=False)
-                    fc = res.forecast(horizon=1, reindex=False)
-                    last_vol[due_ph] = float(np.sqrt(fc.variance.iloc[-1].values[0]) * np.sqrt(252.0))
-                except Exception:
-                    pass
-            for ph in range(PHASE_COUNT):
-                vol_5ph[t3x][ph, idx_t] = last_vol[ph]
-
-        for ph in range(PHASE_COUNT):
-            s_v = pd.Series(vol_5ph[t3x][ph], index=dates_sub).ffill().bfill()
-            s_med = s_v.rolling(QUANTILE_WINDOW, min_periods=60).median().shift(1)
-            s_q975 = s_v.rolling(QUANTILE_WINDOW, min_periods=60).quantile(O_EXIT_Q).shift(1)
-            s_q900 = s_v.rolling(QUANTILE_WINDOW, min_periods=60).quantile(O_ENTRY_Q).shift(1)
-            v_arr = s_v.to_numpy(dtype=float)
-            m_arr = s_med.to_numpy(dtype=float)
-            q_arr, a_arr = run_q_state_machine_1d(v_arr, m_arr)
-            vol_5ph[t3x][ph] = v_arr
-            med_5ph[t3x][ph] = m_arr
-            q_5ph[t3x][ph] = q_arr
-            a_5ph[t3x][ph] = a_arr
-
-            g_state = 1.0
-            for k_i in range(len(v_arr)):
-                if np.isfinite(v_arr[k_i]) and np.isfinite(s_q975.iloc[k_i]):
-                    if v_arr[k_i] > s_q975.iloc[k_i]:
-                        g_state = 0.0
-                    elif v_arr[k_i] < s_q900.iloc[k_i]:
-                        g_state = 1.0
-                g_o_5ph[t3x][ph, k_i] = g_state
-
-    replay_start = max(GARCH_WINDOW + QUANTILE_WINDOW, len(dates_sub) - 120)
-    r_on_df = ((sub_opens[ALL_EXEC_ASSETS] / sub_closes[ALL_EXEC_ASSETS].shift(1)) - 1.0).fillna(0.0)
-    r_id_df = ((sub_closes[ALL_EXEC_ASSETS] / sub_opens[ALL_EXEC_ASSETS]) - 1.0).fillna(0.0)
-
-    phase_latest_records = []
-    for ph in range(PHASE_COUNT):
-        holdings = {k: 0.0 for k in ALL_EXEC_ASSETS}
-        prev_lead = None
-        prev_s = None
-        prev_q = None
-        prev_safe = None
-        prev_base_w = None
-        prev_b = None
-
-        for idx in range(replay_start, len(dates_sub)):
-            sig_dt = dates_sub[idx - 1]
-            lead_3x = str(m_sig["daily_leader_3x"].loc[sig_dt])
-            if lead_3x not in TRADE_ETFS_3X:
-                lead_3x = "UPRO"
-            safe_1x = str(m_sig["daily_safe_win"].loc[sig_dt])
-            if safe_1x not in SAFE_POOL:
-                safe_1x = "GLD"
-            s_val = float(m_sig["daily_sma6_by_3x"].loc[sig_dt, lead_3x])
-            if not np.isfinite(s_val):
-                s_val = 1.0
-            q_val = float(q_5ph[lead_3x][ph, idx - 1])
-            if not np.isfinite(q_val):
-                q_val = 1.0
-            a_val = float(a_5ph[lead_3x][ph, idx - 1])
-            if not np.isfinite(a_val):
-                a_val = 1.0
-            b_val = q_val * (0.5 * s_val + 0.5 * a_val)
-
-            base_w = {k: 0.0 for k in ALL_EXEC_ASSETS}
-            base_w[lead_3x] = b_val
-            base_w[safe_1x] = 1.0 - b_val
-
-            if prev_lead is None:
-                mand = True
-            else:
-                supp_chg = any((base_w[k] > 1e-9) != (prev_base_w[k] > 1e-9) for k in ALL_EXEC_ASSETS)
-                mand = (
-                    (lead_3x != prev_lead)
-                    or (s_val != prev_s)
-                    or (q_val != prev_q)
-                    or (safe_1x != prev_safe)
-                    or supp_chg
-                    or (b_val < prev_b - 1e-12)
-                )
-
-            d_max = max(abs(holdings[k] - base_w[k]) for k in ALL_EXEC_ASSETS)
-            if mand:
-                plan_w = dict(base_w)
-            elif d_max >= BAND_TRIG_TH and d_max > 0:
-                ratio = BAND_DEST_TH / d_max
-                plan_w = {k: base_w[k] + ratio * (holdings[k] - base_w[k]) for k in ALL_EXEC_ASSETS}
-            else:
-                plan_w = dict(holdings)
-
-            if mand or d_max >= BAND_TRIG_TH:
-                end_vals = {k: plan_w[k] * (1.0 + float(r_id_df.iloc[idx][k])) for k in ALL_EXEC_ASSETS}
-            else:
-                end_vals = {
-                    k: holdings[k] * (1.0 + float(r_on_df.iloc[idx][k])) * (1.0 + float(r_id_df.iloc[idx][k]))
-                    for k in ALL_EXEC_ASSETS
-                }
-            tot_v = sum(end_vals.values())
-            holdings = {k: (end_vals[k] / tot_v if tot_v > 0 else base_w[k]) for k in ALL_EXEC_ASSETS}
-
-            prev_lead, prev_s, prev_q, prev_safe, prev_base_w, prev_b = (
-                lead_3x, s_val, q_val, safe_1x, dict(base_w), b_val
-            )
-
-        idx_now = len(dates_sub) - 1
-        winner_now = str(m_sig["sel_df"].index[0])
-        safe_now = str(m_sig["safe_win"])
-        s_now = float(m_sig["sel_df"].loc[winner_now, "SMA6_State"])
-        q_now = float(q_5ph[winner_now][ph, idx_now])
-        a_now = float(a_5ph[winner_now][ph, idx_now])
-        sig_now = float(vol_5ph[winner_now][ph, idx_now])
-        med_now = float(med_5ph[winner_now][ph, idx_now])
-        rho_now = sig_now / med_now if (np.isfinite(med_now) and med_now > 0) else np.nan
-        g_o_now = float(g_o_5ph[winner_now][ph, idx_now])
-
-        b_now = q_now * (0.5 * s_now + 0.5 * a_now)
-        b_o_now = 0.5 * s_now + 0.5 * g_o_now
-        base_w_now = {k: 0.0 for k in ALL_EXEC_ASSETS}
-        base_w_now[winner_now] = b_now
-        base_w_now[safe_now] = 1.0 - b_now
-
-        reasons = []
-        if winner_now != prev_lead:
-            reasons.append("RANK換股")
-        if s_now != prev_s:
-            reasons.append("SMA6翻轉")
-        if q_now != prev_q:
-            reasons.append("Q危機閘門翻轉")
-        if safe_now != prev_safe:
-            reasons.append("避險標的換倉")
-        if any((base_w_now[k] > 1e-9) != (prev_base_w[k] > 1e-9) for k in ALL_EXEC_ASSETS):
-            reasons.append("持倉集合改變")
-        if b_now < prev_b - 1e-12:
-            reasons.append("股票預算調降(減碼)")
-
-        mand_now = len(reasons) > 0
-        d_max_now = max(abs(holdings[k] - base_w_now[k]) for k in ALL_EXEC_ASSETS)
-
-        if mand_now:
-            act_now = 2
-            plan_w_now = dict(base_w_now)
-        elif d_max_now >= BAND_TRIG_TH and d_max_now > 0:
-            act_now = 1
-            ratio = BAND_DEST_TH / d_max_now
-            plan_w_now = {k: base_w_now[k] + ratio * (holdings[k] - base_w_now[k]) for k in ALL_EXEC_ASSETS}
-        else:
-            act_now = 0
-            plan_w_now = dict(holdings)
-
-        phase_latest_records.append({
-            "Phase": ph,
-            "Trade_ETF_3x": winner_now,
-            "Safe_ETF_1x": safe_now,
-            "Sigma_Ann_Pct": round(sig_now, 2) if np.isfinite(sig_now) else np.nan,
-            "Med252_Pct": round(med_now, 2) if np.isfinite(med_now) else np.nan,
-            "Rho_Ratio": round(rho_now, 3) if np.isfinite(rho_now) else np.nan,
-            "Q_Gate": int(q_now),
-            "SMA6": int(s_now),
-            "a_Scalar": round(a_now, 4),
-            "Base_Stock_Weight": round(b_now, 4),
-            "Base_Safe_Weight": round(1.0 - b_now, 4),
-            "O_Stock_Weight": round(b_o_now, 4),
-            "Prior_Close_Weights": holdings,
-            "Base_Target_Weights": base_w_now,
-            "Planned_Open_Weights": plan_w_now,
-            "Decision_Distance_bps": round(d_max_now * 10000.0, 1),
-            "Action_Code": act_now,
-            "Mandatory_Reasons": ", ".join(reasons) if reasons else "無",
-        })
-
-    return m_sig, phase_latest_records
-
-
-# ==========================================
-# 5. 超長歷史 (1998–至今) 高速 5 相位向量化回測引擎與量化指標計算器
-# ==========================================
-@st.cache_data(ttl=180, show_spinner="正在建構 1998–至今 (28+ 年) 五相位超長歷史回測曲線與滾動指標...")
-def run_ultra_long_history_backtest(
-    closes: pd.DataFrame, opens: pd.DataFrame, rf_ann: pd.Series, fee_bps: int, last_dt_key: str
-):
-    """高速計算 1998–至今之 5 相位 REBAND_HF0_200_0、SCOPE_HALF_F0、原版策略 O 與 SPY 買入持有完整日頻回測。"""
-    m_sig = calculate_monthly_signals_1x(closes)
-    dates = closes.index
+def build_strict_gate_matrices(dates: pd.DatetimeIndex, vol_5ph: dict):
+    """嚴格以 min_periods=252 與 shift(1) 建構 Q 斷路器、252 日中位數與舊版 O 分位數閘門。"""
     n_total = len(dates)
+    q_5ph = {t3x: np.full((PHASE_COUNT, n_total), np.nan, dtype=float) for t3x in TRADE_ETFS_3X}
+    med_5ph = {t3x: np.full((PHASE_COUNT, n_total), np.nan, dtype=float) for t3x in TRADE_ETFS_3X}
+    g_o_5ph = {t3x: np.full((PHASE_COUNT, n_total), np.nan, dtype=float) for t3x in TRADE_ETFS_3X}
 
-    # 1. 對 SPY, VGK, EEM 建立 504 日錨定 GARCH(1,1) 5 相位階梯波動率預測序列
-    vol_5ph = {t3x: np.full((PHASE_COUNT, n_total), 18.0, dtype=float) for t3x in TRADE_ETFS_3X}
-    q_5ph = {t3x: np.ones((PHASE_COUNT, n_total), dtype=float) for t3x in TRADE_ETFS_3X}
-    a_5ph = {t3x: np.ones((PHASE_COUNT, n_total), dtype=float) for t3x in TRADE_ETFS_3X}
-    g_o_5ph = {t3x: np.ones((PHASE_COUNT, n_total), dtype=float) for t3x in TRADE_ETFS_3X}
-
-    alpha_g = 0.135
-    beta_g = 0.850
-    gamma_l = 1.0 - alpha_g - beta_g
-
-    for t3x, proto_1x in MAPPING.items():
-        ret_pct = (((closes[proto_1x] / closes[proto_1x].shift(1)) - 1.0) * 100.0).fillna(0.0).to_numpy(dtype=float)
-        s_ret = pd.Series(ret_pct)
-        med_ret = s_ret.rolling(GARCH_WINDOW, min_periods=120).median().bfill().fillna(0.0)
-        mad_504 = (s_ret - med_ret).abs().rolling(GARCH_WINDOW, min_periods=120).median().bfill().fillna(0.6).to_numpy(dtype=float)
-        var_rob = (mad_504 * 1.4826) ** 2
-        h_raw = np.zeros(n_total, dtype=float)
-        h_curr = float(var_rob[0]) if np.isfinite(var_rob[0]) else 1.0
-        for t in range(n_total):
-            if t > 0:
-                omega_t = gamma_l * float(var_rob[t])
-                h_curr = omega_t + alpha_g * (ret_pct[t] ** 2) + beta_g * h_curr
-            h_raw[t] = h_curr
-        sig_cont = np.sqrt(np.maximum(h_raw, 1e-6)) * np.sqrt(252.0)
-
-        # 嚴格按 5 相位 (t - 504) % 5 == ph 階梯取樣並維持 5 日
+    for t3x in TRADE_ETFS_3X:
         for ph in range(PHASE_COUNT):
-            v_ph = np.full(n_total, np.nan, dtype=float)
-            last_v = float(sig_cont[GARCH_WINDOW]) if n_total > GARCH_WINDOW else 18.0
-            for t in range(GARCH_WINDOW, n_total):
-                if (t - GARCH_WINDOW) % PHASE_COUNT == ph:
-                    last_v = float(sig_cont[t])
-                v_ph[t] = last_v
-            s_v = pd.Series(v_ph, index=dates).ffill().bfill()
-            s_med = s_v.rolling(QUANTILE_WINDOW, min_periods=60).median().shift(1)
-            s_q975 = s_v.rolling(QUANTILE_WINDOW, min_periods=60).quantile(O_EXIT_Q).shift(1)
-            s_q900 = s_v.rolling(QUANTILE_WINDOW, min_periods=60).quantile(O_ENTRY_Q).shift(1)
+            s_v = pd.Series(vol_5ph[t3x][ph], index=dates)  # 嚴格禁止 .bfill()
+            s_med = s_v.rolling(QUANTILE_WINDOW, min_periods=QUANTILE_WINDOW).median().shift(1)
+            s_q975 = s_v.rolling(QUANTILE_WINDOW, min_periods=QUANTILE_WINDOW).quantile(O_EXIT_Q).shift(1)
+            s_q900 = s_v.rolling(QUANTILE_WINDOW, min_periods=QUANTILE_WINDOW).quantile(O_ENTRY_Q).shift(1)
+
             v_arr = s_v.to_numpy(dtype=float)
             m_arr = s_med.to_numpy(dtype=float)
-            q_arr, a_arr = run_q_state_machine_1d(v_arr, m_arr)
-            vol_5ph[t3x][ph] = v_arr
-            q_5ph[t3x][ph] = q_arr
-            a_5ph[t3x][ph] = a_arr
+            med_5ph[t3x][ph] = m_arr
+            q_5ph[t3x][ph] = run_q_state_machine_strict(v_arr, m_arr)
 
             g_state = 1.0
             q975_arr = s_q975.to_numpy(dtype=float)
             q900_arr = s_q900.to_numpy(dtype=float)
-            for k_i in range(n_total):
-                if np.isfinite(v_arr[k_i]) and np.isfinite(q975_arr[k_i]):
-                    if v_arr[k_i] > q975_arr[k_i]:
+            for k in range(n_total):
+                if np.isfinite(v_arr[k]) and np.isfinite(q975_arr[k]) and np.isfinite(q900_arr[k]):
+                    if v_arr[k] > q975_arr[k]:
                         g_state = 0.0
-                    elif v_arr[k_i] < q900_arr[k_i]:
+                    elif v_arr[k] < q900_arr[k]:
                         g_state = 1.0
-                g_o_5ph[t3x][ph, k_i] = g_state
+                    g_o_5ph[t3x][ph, k] = g_state
 
-    # 2. 從 1998-03-02 (或第 760 個交易日) 開始執行 T+1 Open 5 相位投資組合微結構模擬
-    start_idx = GARCH_WINDOW + QUANTILE_WINDOW + 10
-    sim_dates = dates[start_idx:]
-    n_sim = len(sim_dates)
+    return q_5ph, med_5ph, g_o_5ph
 
-    r_on_mat = ((opens[ALL_EXEC_ASSETS] / closes[ALL_EXEC_ASSETS].shift(1)) - 1.0).fillna(0.0).to_numpy(dtype=float)
-    r_id_mat = ((closes[ALL_EXEC_ASSETS] / opens[ALL_EXEC_ASSETS]) - 1.0).fillna(0.0).to_numpy(dtype=float)
+
+def run_unified_reband_qonly_engine(
+    closes: pd.DataFrame,
+    opens: pd.DataFrame,
+    rf_ann: pd.Series,
+    m_sig: dict,
+    vol_5ph: dict,
+    q_5ph: dict,
+    med_5ph: dict,
+    g_o_5ph: dict,
+    start_date_str: str,
+    fee_bps: int,
+    compute_benchmarks: bool = True,
+):
+    """
+    單一真相引擎（實盤分頁 1 與回測分頁 2 100% 共用）：
+    - 嚴格 T+1 開盤成交、納入隔夜跳空漂移與雙邊交易成本。
+    - 5 相位獨立子帳戶真實淨值加總（無跨相位免費每日再平衡假象）。
+    - 同步輸出完整歷史回測序列、避險三指標診斷矩陣與「明日開盤實盤下單指令」。
+    """
+    dates = closes.index
+    r_on_mat = ((opens[ALL_EXEC_ASSETS] / closes[ALL_EXEC_ASSETS].shift(1)) - 1.0).to_numpy(dtype=float)
+    r_id_mat = ((closes[ALL_EXEC_ASSETS] / opens[ALL_EXEC_ASSETS]) - 1.0).to_numpy(dtype=float)
+
     asset_to_col = {k: i for i, k in enumerate(ALL_EXEC_ASSETS)}
-
+    t3x_to_idx = {k: i for i, k in enumerate(TRADE_ETFS_3X)}
     lead_arr = m_sig["daily_leader_3x"].to_numpy()
     safe_arr = m_sig["daily_safe_win"].to_numpy()
     sma_mat = m_sig["daily_sma6_by_3x"][TRADE_ETFS_3X].to_numpy(dtype=float)
-    t3x_to_idx = {k: i for i, k in enumerate(TRADE_ETFS_3X)}
 
+    cand_start = int(dates.searchsorted(pd.Timestamp(start_date_str)))
+    start_idx = None
+    for idx in range(max(1, cand_start), len(dates)):
+        sig_idx = idx - 1
+        l_s, sf_s = lead_arr[sig_idx], safe_arr[sig_idx]
+        if pd.isna(l_s) or pd.isna(sf_s):
+            continue
+        if not (np.all(np.isfinite(r_on_mat[idx])) and np.all(np.isfinite(r_id_mat[idx]))):
+            continue
+        if not np.all(np.isfinite(sma_mat[sig_idx])):
+            continue
+        if all(
+            np.isfinite(q_5ph[t3x][ph, sig_idx]) and np.isfinite(g_o_5ph[t3x][ph, sig_idx])
+            for t3x in TRADE_ETFS_3X
+            for ph in range(PHASE_COUNT)
+        ):
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        raise ValueError(f"找不到有效起算日 (>= {start_date_str})，請確認數據與 GARCH 暖機完成。")
+
+    sim_dates = dates[start_idx:]
+    n_sim = len(sim_dates)
     fee_rate = float(fee_bps) / 10000.0
 
-    # 儲存 5 相位平均之每日淨報酬率與換手率
-    ret_reband = np.zeros(n_sim, dtype=float)
-    ret_hf0 = np.zeros(n_sim, dtype=float)
-    ret_o = np.zeros(n_sim, dtype=float)
+    specs = [("REBAND_QONLY_200_0", "QONLY", True)]
+    if compute_benchmarks:
+        specs.extend([
+            ("SCOPE_QONLY_F0", "QONLY", False),
+            ("O_Q4_200_0", "OLD_O", True),
+            ("NO_VOL_GATE", "NONE", True),
+        ])
 
-    to_reband = np.zeros(n_sim, dtype=float)
-    to_hf0 = np.zeros(n_sim, dtype=float)
-    to_o = np.zeros(n_sim, dtype=float)
-    skip_reband = np.zeros(n_sim, dtype=float)
-    eq_w_reband = np.zeros(n_sim, dtype=float)
+    out_rets, out_to, out_skip, out_eq_w = {}, {}, {}, {}
+    active_gate_by_strat = {}
+    phase_latest_records = []
 
-    for ph in range(PHASE_COUNT):
-        h_reb = np.zeros(5, dtype=float)
-        h_hf0 = np.zeros(5, dtype=float)
-        h_o = np.zeros(5, dtype=float)
+    active_sma = np.zeros(n_sim, dtype=float)
+    active_atk_r = np.zeros(n_sim, dtype=float)
+    active_safe_r = np.zeros(n_sim, dtype=float)
+    for s_i in range(n_sim):
+        t_idx = start_idx + s_i
+        sig_idx = t_idx - 1
+        l_str, sf_str = str(lead_arr[sig_idx]), str(safe_arr[sig_idx])
+        l_col, sf_col = asset_to_col[l_str], asset_to_col[sf_str]
+        active_sma[s_i] = float(sma_mat[sig_idx, t3x_to_idx[l_str]])
+        active_atk_r[s_i] = (1.0 + r_on_mat[t_idx, l_col]) * (1.0 + r_id_mat[t_idx, l_col]) - 1.0
+        active_safe_r[s_i] = (1.0 + r_on_mat[t_idx, sf_col]) * (1.0 + r_id_mat[t_idx, sf_col]) - 1.0
 
-        prev_lead = None
-        prev_s = None
-        prev_q = None
-        prev_safe = None
-        prev_base = np.zeros(5, dtype=float)
-        prev_b = None
+    for name, mode, use_band in specs:
+        n_ph = 1 if mode == "NONE" else PHASE_COUNT
+        phase_navs = np.ones((n_ph, n_sim), dtype=float)
+        phase_to = np.zeros((n_ph, n_sim), dtype=float)
+        phase_skip = np.zeros((n_ph, n_sim), dtype=float)
+        phase_eq_w = np.zeros((n_ph, n_sim), dtype=float)
+        phase_gate = np.ones((n_ph, n_sim), dtype=float)
 
-        for s_i in range(n_sim):
-            t_idx = start_idx + s_i
-            sig_idx = t_idx - 1
+        for ph in range(n_ph):
+            h_prev = np.zeros(5, dtype=float)
+            nav_curr = 1.0
+            prev_lead, prev_s, prev_gate, prev_safe, prev_b = None, None, None, None, None
+            prev_base = np.zeros(5, dtype=float)
 
-            l_str = str(lead_arr[sig_idx])
-            if l_str not in t3x_to_idx:
-                l_str = "UPRO"
-            sf_str = str(safe_arr[sig_idx])
-            if sf_str not in asset_to_col:
-                sf_str = "GLD"
+            for s_i in range(n_sim):
+                t_idx = start_idx + s_i
+                sig_idx = t_idx - 1
+                l_str, sf_str = str(lead_arr[sig_idx]), str(safe_arr[sig_idx])
+                l_col, sf_col = asset_to_col[l_str], asset_to_col[sf_str]
+                s_val = float(sma_mat[sig_idx, t3x_to_idx[l_str]])
 
-            l_col = asset_to_col[l_str]
-            sf_col = asset_to_col[sf_str]
-            s_val = float(sma_mat[sig_idx, t3x_to_idx[l_str]])
-            q_val = float(q_5ph[l_str][ph, sig_idx])
-            a_val = float(a_5ph[l_str][ph, sig_idx])
-            g_val = float(g_o_5ph[l_str][ph, sig_idx])
+                if mode == "NONE":
+                    gate_flag = 1.0
+                    b_val = 0.5 * s_val + 0.5
+                elif mode == "OLD_O":
+                    gate_flag = float(g_o_5ph[l_str][ph, sig_idx])
+                    b_val = 0.5 * s_val + 0.5 * gate_flag
+                else:  # QONLY: B = Q * (0.5*S + 0.5)
+                    gate_flag = float(q_5ph[l_str][ph, sig_idx])
+                    b_val = gate_flag * (0.5 * s_val + 0.5)
 
-            b_hf0 = q_val * (0.5 * s_val + 0.5 * a_val)
-            b_o = 0.5 * s_val + 0.5 * g_val
+                phase_gate[ph, s_i] = gate_flag
+                base_w = np.zeros(5, dtype=float)
+                base_w[l_col] = b_val
+                base_w[sf_col] = 1.0 - b_val
 
-            base_hf0 = np.zeros(5, dtype=float)
-            base_hf0[l_col] = b_hf0
-            base_hf0[sf_col] = 1.0 - b_hf0
+                r_on = r_on_mat[t_idx]
+                r_id = r_id_mat[t_idx]
 
-            base_o = np.zeros(5, dtype=float)
-            base_o[l_col] = b_o
-            base_o[sf_col] = 1.0 - b_o
+                if not use_band:
+                    traded = True
+                    plan_w = base_w.copy()
+                else:
+                    if prev_lead is None:
+                        mand = True
+                    else:
+                        supp_chg = bool(np.any((base_w > 1e-9) != (prev_base > 1e-9)))
+                        mand = (
+                            (l_str != prev_lead)
+                            or (s_val != prev_s)
+                            or (gate_flag != prev_gate)
+                            or (sf_str != prev_safe)
+                            or supp_chg
+                            or (b_val < prev_b - 1e-12)
+                        )
+                    d_max = float(np.max(np.abs(h_prev - base_w)))
+                    if mand or (d_max >= BAND_TRIG_TH):
+                        traded = True
+                        plan_w = base_w.copy()
+                    else:
+                        traded = False
+                        plan_w = h_prev.copy()
 
-            r_on = r_on_mat[t_idx]
-            r_id = r_id_mat[t_idx]
+                if s_i == 0:
+                    nav_on = 1.0
+                    turn = float(np.sum(np.abs(plan_w)))
+                else:
+                    nav_on = float(np.sum(h_prev * (1.0 + r_on)))
+                    open_w = (h_prev * (1.0 + r_on)) / nav_on if nav_on > 0 else h_prev.copy()
+                    if traded:
+                        turn = float(np.sum(np.abs(plan_w - open_w)))
+                    else:
+                        turn = 0.0
+                        plan_w = open_w
 
-            # --- A. REBAND_HF0_200_0 執行 ---
-            if prev_lead is None:
-                mand = True
-            else:
-                supp_chg = bool(np.any((base_hf0 > 1e-9) != (prev_base > 1e-9)))
-                mand = (
-                    (l_str != prev_lead)
-                    or (s_val != prev_s)
-                    or (q_val != prev_q)
-                    or (sf_str != prev_safe)
-                    or supp_chg
-                    or (b_hf0 < prev_b - 1e-12)
+                nav_id = float(np.sum(plan_w * (1.0 + r_id)))
+                r_day = nav_on * max(0.0, 1.0 - fee_rate * turn) * nav_id - 1.0
+                nav_curr *= (1.0 + r_day)
+
+                end_v = plan_w * (1.0 + r_id)
+                h_prev = end_v / float(np.sum(end_v)) if np.sum(end_v) > 0 else base_w.copy()
+
+                phase_navs[ph, s_i] = nav_curr
+                phase_to[ph, s_i] = turn
+                phase_skip[ph, s_i] = 0.0 if traded else 1.0
+                phase_eq_w[ph, s_i] = float(np.sum(plan_w[:3]))
+
+                prev_lead, prev_s, prev_gate, prev_safe, prev_base, prev_b = (
+                    l_str, s_val, gate_flag, sf_str, base_w.copy(), b_val
                 )
-            d_max = float(np.max(np.abs(h_reb - base_hf0)))
-            if mand:
-                plan_reb = base_hf0.copy()
-                traded_reb = True
-            elif d_max >= BAND_TRIG_TH and d_max > 0:
-                plan_reb = base_hf0 + (BAND_DEST_TH / d_max) * (h_reb - base_hf0)
-                traded_reb = True
-            else:
-                plan_reb = h_reb.copy()
-                traded_reb = False
 
-            # 開盤前隔夜漂移
-            if s_i == 0:
-                open_w_reb = plan_reb.copy()
-                turn_reb = float(np.sum(np.abs(plan_reb)))
-            else:
-                nav_on = float(np.sum(h_reb * (1.0 + r_on)))
-                open_w_reb = (h_reb * (1.0 + r_on)) / nav_on if nav_on > 0 else h_reb.copy()
-                turn_reb = float(np.sum(np.abs(plan_reb - open_w_reb))) if traded_reb else 0.0
-                if not traded_reb:
-                    plan_reb = open_w_reb
+            # 針對主系統 REBAND_QONLY_200_0 產出最新收盤後之「下一交易日開盤執行計畫」
+            if name == "REBAND_QONLY_200_0":
+                idx_now = len(dates) - 1
+                winner_now = str(m_sig["sel_df"].index[0])
+                safe_now = str(m_sig["safe_win"])
+                s_now = float(m_sig["sel_df"].loc[winner_now, "SMA6_State"])
+                q_now = float(q_5ph[winner_now][ph, idx_now])
+                sig_now = float(vol_5ph[winner_now][ph, idx_now])
+                med_now = float(med_5ph[winner_now][ph, idx_now])
+                rho_now = sig_now / med_now if (np.isfinite(med_now) and med_now > 0) else np.nan
+                g_o_now = float(g_o_5ph[winner_now][ph, idx_now])
 
-            nav_on_reb = 1.0 if s_i == 0 else float(np.sum(h_reb * (1.0 + r_on)))
-            nav_id_reb = float(np.sum(plan_reb * (1.0 + r_id)))
-            fee_mult_reb = max(0.0, 1.0 - fee_rate * turn_reb)
-            r_day_reb = nav_on_reb * fee_mult_reb * nav_id_reb - 1.0
-            end_v_reb = plan_reb * (1.0 + r_id)
-            h_reb = end_v_reb / float(np.sum(end_v_reb)) if np.sum(end_v_reb) > 0 else base_hf0.copy()
+                b_now = q_now * (0.5 * s_now + 0.5)
+                b_o_now = 0.5 * s_now + 0.5 * g_o_now
+                base_w_now = {k: 0.0 for k in ALL_EXEC_ASSETS}
+                base_w_now[winner_now] = b_now
+                base_w_now[safe_now] = 1.0 - b_now
+                holdings_dict = {ALL_EXEC_ASSETS[i]: float(h_prev[i]) for i in range(5)}
 
-            ret_reband[s_i] += r_day_reb / PHASE_COUNT
-            to_reband[s_i] += turn_reb / PHASE_COUNT
-            skip_reband[s_i] += (0.0 if traded_reb else 1.0) / PHASE_COUNT
-            eq_w_reband[s_i] += b_hf0 / PHASE_COUNT
+                reasons = []
+                if winner_now != prev_lead:
+                    reasons.append("RANK換股")
+                if s_now != prev_s:
+                    reasons.append("SMA6翻轉")
+                if q_now != prev_gate:
+                    reasons.append("Q危機閘門翻轉")
+                if safe_now != prev_safe:
+                    reasons.append("避險標的換倉")
+                if any((base_w_now[ALL_EXEC_ASSETS[i]] > 1e-9) != (prev_base[i] > 1e-9) for i in range(5)):
+                    reasons.append("持倉集合改變")
+                if b_now < prev_b - 1e-12:
+                    reasons.append("股票預算調降(減碼)")
 
-            prev_lead, prev_s, prev_q, prev_safe, prev_base, prev_b = (
-                l_str, s_val, q_val, sf_str, base_hf0.copy(), b_hf0
-            )
+                mand_now = len(reasons) > 0
+                d_max_now = max(abs(holdings_dict[k] - base_w_now[k]) for k in ALL_EXEC_ASSETS)
+                if mand_now:
+                    act_now = 2
+                    plan_w_now = dict(base_w_now)
+                elif d_max_now >= BAND_TRIG_TH:
+                    act_now = 1
+                    plan_w_now = dict(base_w_now)
+                else:
+                    act_now = 0
+                    plan_w_now = dict(holdings_dict)
 
-            # --- B. SCOPE_HALF_F0 (無護欄每日調倉) ---
-            if s_i == 0:
-                turn_hf0 = float(np.sum(np.abs(base_hf0)))
-                nav_on_hf0 = 1.0
-            else:
-                nav_on_hf0 = float(np.sum(h_hf0 * (1.0 + r_on)))
-                open_w_hf0 = (h_hf0 * (1.0 + r_on)) / nav_on_hf0 if nav_on_hf0 > 0 else h_hf0.copy()
-                turn_hf0 = float(np.sum(np.abs(base_hf0 - open_w_hf0)))
-            nav_id_hf0 = float(np.sum(base_hf0 * (1.0 + r_id)))
-            r_day_hf0 = nav_on_hf0 * max(0.0, 1.0 - fee_rate * turn_hf0) * nav_id_hf0 - 1.0
-            end_v_hf0 = base_hf0 * (1.0 + r_id)
-            h_hf0 = end_v_hf0 / float(np.sum(end_v_hf0)) if np.sum(end_v_hf0) > 0 else base_hf0.copy()
-            ret_hf0[s_i] += r_day_hf0 / PHASE_COUNT
-            to_hf0[s_i] += turn_hf0 / PHASE_COUNT
+                phase_latest_records.append({
+                    "Phase": ph,
+                    "Trade_ETF_3x": winner_now,
+                    "Safe_ETF_1x": safe_now,
+                    "Sigma_Ann_Pct": round(sig_now, 2) if np.isfinite(sig_now) else np.nan,
+                    "Med252_Pct": round(med_now, 2) if np.isfinite(med_now) else np.nan,
+                    "Rho_Ratio": round(rho_now, 3) if np.isfinite(rho_now) else np.nan,
+                    "Q_Gate": int(q_now),
+                    "SMA6": int(s_now),
+                    "Base_Stock_Weight": round(b_now, 4),
+                    "Base_Safe_Weight": round(1.0 - b_now, 4),
+                    "O_Stock_Weight": round(b_o_now, 4),
+                    "Prior_Close_Weights": holdings_dict,
+                    "Base_Target_Weights": base_w_now,
+                    "Planned_Open_Weights": plan_w_now,
+                    "Decision_Distance_bps": round(d_max_now * 10000.0, 1),
+                    "Action_Code": act_now,
+                    "Mandatory_Reasons": ", ".join(reasons) if reasons else "無",
+                    "Phase_NAV": nav_curr,
+                })
 
-            # --- C. 原版策略 O (97.5%/90% 分位數二元閘門、每日調倉) ---
-            if s_i == 0:
-                turn_o = float(np.sum(np.abs(base_o)))
-                nav_on_o = 1.0
-            else:
-                nav_on_o = float(np.sum(h_o * (1.0 + r_on)))
-                open_w_o = (h_o * (1.0 + r_on)) / nav_on_o if nav_on_o > 0 else h_o.copy()
-                turn_o = float(np.sum(np.abs(base_o - open_w_o)))
-            nav_id_o = float(np.sum(base_o * (1.0 + r_id)))
-            r_day_o = nav_on_o * max(0.0, 1.0 - fee_rate * turn_o) * nav_id_o - 1.0
-            end_v_o = base_o * (1.0 + r_id)
-            h_o = end_v_o / float(np.sum(end_v_o)) if np.sum(end_v_o) > 0 else base_o.copy()
-            ret_o[s_i] += r_day_o / PHASE_COUNT
-            to_o[s_i] += turn_o / PHASE_COUNT
+        agg_nav = np.mean(phase_navs, axis=0)
+        agg_r = np.empty(n_sim, dtype=float)
+        agg_r[0] = agg_nav[0] - 1.0
+        agg_r[1:] = (agg_nav[1:] / agg_nav[:-1]) - 1.0
+
+        prev_caps = np.ones((n_ph, n_sim), dtype=float)
+        prev_caps[:, 1:] = phase_navs[:, :-1]
+        cap_w = prev_caps / np.sum(prev_caps, axis=0, keepdims=True)
+
+        out_rets[name] = agg_r
+        out_to[name] = np.sum(cap_w * phase_to, axis=0)
+        out_skip[name] = np.mean(phase_skip, axis=0)
+        out_eq_w[name] = np.sum(cap_w * phase_eq_w, axis=0)
+        active_gate_by_strat[name] = phase_gate
 
     ret_spy = ((closes["SPY"].reindex(sim_dates) / closes["SPY"].reindex(sim_dates).shift(1)) - 1.0).fillna(0.0).to_numpy(dtype=float)
-    rf_daily = (rf_ann.reindex(sim_dates).ffill().fillna(0.025).to_numpy(dtype=float)) / 252.0
+    rf_d = (rf_ann.reindex(sim_dates).ffill().fillna(0.025).to_numpy(dtype=float)) / 252.0
 
-    bt_df = pd.DataFrame(
-        {
-            "REBAND_HF0_200_0": ret_reband,
-            "SCOPE_HALF_F0": ret_hf0,
-            "Strategy_O": ret_o,
-            "SPY_1x": ret_spy,
-            "RF_Daily": rf_daily,
-            "Turnover_REBAND": to_reband,
-            "Turnover_HF0": to_hf0,
-            "Turnover_O": to_o,
-            "Skip_Frac_REBAND": skip_reband,
-            "Equity_Weight_REBAND": eq_w_reband,
-        },
-        index=sim_dates,
-    )
-    return bt_df, m_sig["hist_rot_df"]
+    bt_df = pd.DataFrame(out_rets, index=sim_dates)
+    bt_df["SPY_1x"] = ret_spy
+    bt_df["RF_Daily"] = rf_d
+    for k in out_to:
+        bt_df[f"TO_{k}"] = out_to[k]
+        bt_df[f"SKIP_{k}"] = out_skip[k]
+        bt_df[f"EQW_{k}"] = out_eq_w[k]
+
+    diag = {
+        "active_sma": pd.Series(active_sma, index=sim_dates),
+        "active_atk_r": pd.Series(active_atk_r, index=sim_dates),
+        "active_safe_r": pd.Series(active_safe_r, index=sim_dates),
+        "active_gate": active_gate_by_strat,
+    }
+    return bt_df, diag, phase_latest_records
 
 
+# ==========================================
+# 6. 機構級量化指標與避險三強制指標計算器
+# ==========================================
 def compute_quant_metrics_table(bt_sub: pd.DataFrame, fee_bps: int) -> pd.DataFrame:
-    """計算機構級完整量化指標對照表 (CAGR, Vol, Sharpe, Sortino, MaxDD, Calmar, Ulcer, Recovery Days, Win Rate, Profit Factor, VaR/CVaR, Turnover)。"""
-    strat_Meta = [
-        ("REBAND_HF0_200_0", "🛡️ REBAND_HF0_200_0 (本系統：200/0 bps 護欄)", "Turnover_REBAND"),
-        ("SCOPE_HALF_F0", "⚡ SCOPE_HALF_F0 (無護欄每日調倉)", "Turnover_HF0"),
-        ("Strategy_O", "📊 原版策略 O (舊版分位數基準)", "Turnover_O"),
-        ("SPY_1x", "🇺🇸 SPY (標普 500 買入持有)", None),
+    strat_meta = [
+        ("REBAND_QONLY_200_0", "🛡️ REBAND_QONLY_200_0 (本系統：純Q＋200/0護欄)"),
+        ("SCOPE_QONLY_F0", "⚡ SCOPE_QONLY_F0 (同訊號無護欄每日調倉)"),
+        ("O_Q4_200_0", "📊 公平舊版 O_Q4_200_0 (分位數＋200/0護欄)"),
+        ("NO_VOL_GATE", "🧭 NO_VOL_GATE (無波動開關：僅4季動能＋SMA6)"),
+        ("SPY_1x", "🇺🇸 SPY (標普 500 買入持有)"),
     ]
     rows = []
     rf_d = bt_sub["RF_Daily"].to_numpy(dtype=float)
-    n_days = len(bt_sub)
-    years = max(n_days / 252.0, 1e-6)
+    years = max(len(bt_sub) / 252.0, 1e-6)
 
-    for col, label, to_col in strat_Meta:
+    for col, label in strat_meta:
+        if col not in bt_sub.columns:
+            continue
         r = bt_sub[col].to_numpy(dtype=float)
         nav = np.cumprod(1.0 + r)
-        tot_mult = float(nav[-1]) if len(nav) > 0 else 1.0
+        tot_mult = float(nav[-1])
         cagr = (tot_mult ** (1.0 / years)) - 1.0 if tot_mult > 0 else -1.0
         ann_vol = float(np.std(r, ddof=1) * np.sqrt(252.0))
 
         ex_r = r - rf_d
         sharpe = float(np.mean(ex_r) / (np.std(ex_r, ddof=1) + 1e-12) * np.sqrt(252.0))
-        downside = np.minimum(0.0, ex_r)
-        down_dev = float(np.sqrt(np.mean(downside ** 2)) * np.sqrt(252.0))
+        down_dev = float(np.sqrt(np.mean(np.minimum(0.0, ex_r) ** 2)) * np.sqrt(252.0))
         sortino = float((np.mean(ex_r) * 252.0) / (down_dev + 1e-12))
 
         peak = np.maximum.accumulate(nav)
@@ -1023,74 +1114,192 @@ def compute_quant_metrics_table(bt_sub: pd.DataFrame, fee_bps: int) -> pd.DataFr
         calmar = float(cagr / abs(max_dd)) if abs(max_dd) > 1e-9 else np.nan
         ulcer_idx = float(np.sqrt(np.mean((dd * 100.0) ** 2)))
 
-        underwater = dd < -1e-6
-        max_uw_days = 0
-        curr_uw = 0
-        for u_flag in underwater:
-            if u_flag:
-                curr_uw += 1
-                if curr_uw > max_uw_days:
-                    max_uw_days = curr_uw
-            else:
-                curr_uw = 0
+        max_uw_days, curr_uw = 0, 0
+        for u_flag in (dd < -1e-6):
+            curr_uw = curr_uw + 1 if u_flag else 0
+            max_uw_days = max(max_uw_days, curr_uw)
 
-        s_r = pd.Series(r, index=bt_sub.index)
-        m_rets = s_r.groupby(s_r.index.to_period("M")).apply(lambda x: float(np.prod(1.0 + x) - 1.0))
-        y_rets = s_r.groupby(s_r.index.year).apply(lambda x: float(np.prod(1.0 + x) - 1.0))
-        m_win_rate = float((m_rets > 0).mean()) if len(m_rets) > 0 else np.nan
-        y_win_rate = float((y_rets > 0).mean()) if len(y_rets) > 0 else np.nan
+        s_nav = pd.Series(nav, index=bt_sub.index)
+        r5 = ((s_nav / s_nav.shift(252 * 5)) ** (1.0 / 5.0) - 1.0).dropna() * 100.0
+        r10 = ((s_nav / s_nav.shift(252 * 10)) ** (1.0 / 10.0) - 1.0).dropna() * 100.0
 
-        pos_sum = float(np.sum(r[r > 0]))
-        neg_sum = float(abs(np.sum(r[r < 0])))
-        profit_factor = pos_sum / neg_sum if neg_sum > 0 else np.nan
-
-        var_95 = float(np.percentile(r, 5))
-        cvar_95 = float(np.mean(r[r <= var_95])) if np.any(r <= var_95) else var_95
-
-        if to_col is not None:
-            ann_to = float(bt_sub[to_col].mean() * 252.0)
-            fee_drag_bps = ann_to * float(fee_bps)
-        else:
-            ann_to = 0.0
-            fee_drag_bps = 0.0
+        to_col = f"TO_{col}"
+        skip_col = f"SKIP_{col}"
+        ann_to = float(bt_sub[to_col].mean() * 252.0) if to_col in bt_sub.columns else 0.0
+        skip_pct = float(bt_sub[skip_col].mean() * 100.0) if skip_col in bt_sub.columns else 0.0
+        fee_drag_bps = ann_to * float(fee_bps)
 
         rows.append({
             "策略名稱": label,
             "年化報酬 (CAGR)": f"{cagr*100:.2f}%",
             "累積淨值倍數": f"{tot_mult:,.2f}x",
             "年化波動率 (Vol)": f"{ann_vol*100:.2f}%",
-            "夏普比率 (Sharpe)": f"{sharpe:.2f}",
-            "索提諾比率 (Sortino)": f"{sortino:.2f}",
+            "夏普比率 (Sharpe)": f"{sharpe:.3f}",
+            "索提諾比率 (Sortino)": f"{sortino:.3f}",
             "最大回撤 (MaxDD)": f"{max_dd*100:.2f}%",
             "卡瑪比率 (Calmar)": f"{calmar:.2f}",
             "潰瘍指數 (Ulcer)": f"{ulcer_idx:.2f}",
-            "最長水下天數 (交易日)": f"{max_uw_days} 天",
-            "月勝率": f"{m_win_rate*100:.1f}%",
-            "年勝率": f"{y_win_rate*100:.1f}%",
-            "獲利因子 (Profit Factor)": f"{profit_factor:.2f}",
-            "日 VaR (95%)": f"{var_95*100:.2f}%",
-            "日 CVaR (95%)": f"{cvar_95*100:.2f}%",
-            "年化周轉率 (倍/年)": f"{ann_to:.2f}x",
-            "年化成本拖累 (bps)": f"-{fee_drag_bps:.1f} bps",
+            "最長水下天數": f"{max_uw_days} 天",
+            "5Y 最差 CAGR": f"{r5.min():.2f}%" if len(r5) > 0 else "N/A",
+            "10Y 最差 CAGR": f"{r10.min():.2f}%" if len(r10) > 0 else "N/A",
+            "年化雙邊周轉": f"{ann_to:.2f}x",
+            "免交易日比例": f"{skip_pct:.2f}%",
+            "年化成本拖累": f"-{fee_drag_bps:.1f} bps",
         })
-
     return pd.DataFrame(rows).set_index("策略名稱")
 
 
+def compute_institutional_hedge_reports(bt_sub: pd.DataFrame, diag_full: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """輸出機構級避險模塊三大強制報表：Crisis Alpha、False Alarm Drag、Whipsaw Count。"""
+    idx = bt_sub.index
+    # 1. Crisis Alpha
+    ca_rows = []
+    for label, s_dt, e_dt in CRISIS_WINDOWS:
+        sub = bt_sub.loc[(idx >= pd.Timestamp(s_dt)) & (idx <= pd.Timestamp(e_dt))]
+        if len(sub) < 10:
+            continue
+        def _rm(col):
+            nav = np.cumprod(1.0 + sub[col].to_numpy(dtype=float))
+            return (nav[-1] - 1.0) * 100.0, np.min(nav / np.maximum.accumulate(nav) - 1.0) * 100.0
+
+        nv_r, _ = _rm("NO_VOL_GATE")
+        q_r, q_dd = _rm("REBAND_QONLY_200_0")
+        o_r, o_dd = _rm("O_Q4_200_0")
+        ca_rows.append({
+            "危機視窗": f"{label} ({sub.index[0].strftime('%Y-%m-%d')}~{sub.index[-1].strftime('%Y-%m-%d')})",
+            "日數": len(sub),
+            "無波動開關(%)": round(nv_r, 2),
+            "REBAND_QONLY(%)": round(q_r, 2),
+            "O_Q4_200_0(%)": round(o_r, 2),
+            "REBAND CrisisAlpha(pp)": round(q_r - nv_r, 2),
+            "O CrisisAlpha(pp)": round(o_r - nv_r, 2),
+            "REBAND 區間MDD(%)": round(q_dd, 2),
+            "O 區間MDD(%)": round(o_dd, 2),
+        })
+    ca_df = pd.DataFrame(ca_rows).set_index("危機視窗") if ca_rows else pd.DataFrame()
+
+    # 2. False Alarm Drag (非危機且 SMA6=1 多頭日)
+    crisis_mask = np.zeros(len(idx), dtype=bool)
+    for label, s_dt, e_dt in CRISIS_WINDOWS:
+        if "完整段" in label:
+            continue
+        crisis_mask |= (idx >= pd.Timestamp(s_dt)) & (idx <= pd.Timestamp(e_dt))
+    sma_sub = diag_full["active_sma"].reindex(idx).to_numpy(dtype=float)
+    bull_mask = (~crisis_mask) & (sma_sub == 1.0)
+    fa_rows = []
+    if bull_mask.sum() >= 20:
+        nv_log = np.log1p(bt_sub["NO_VOL_GATE"].to_numpy(dtype=float)[bull_mask])
+        for s_col, s_lab in [
+            ("REBAND_QONLY_200_0", "REBAND_QONLY_200_0 (本系統)"),
+            ("O_Q4_200_0", "公平舊版 O_Q4_200_0"),
+        ]:
+            st_log = np.log1p(bt_sub[s_col].to_numpy(dtype=float)[bull_mask])
+            ann_drag = float(np.mean(st_log - nv_log) * 252.0 * 100.0)
+            cum_drag = float((np.exp(np.sum(st_log - nv_log)) - 1.0) * 100.0)
+            avg_eq = float(np.mean(bt_sub[f"EQW_{s_col}"].to_numpy(dtype=float)[bull_mask]) * 100.0)
+            fa_rows.append({
+                "策略版本 (非危機且 SMA6=1 多頭日)": s_lab,
+                "樣本日數": int(bull_mask.sum()),
+                "年化多頭出血 Drag (pp/年)": round(ann_drag, 2),
+                "累積多頭相對拖累 (%)": round(cum_drag, 2),
+                "多頭區間平均曝險 (%)": round(avg_eq, 1),
+            })
+    fa_df = pd.DataFrame(fa_rows).set_index("策略版本 (非危機且 SMA6=1 多頭日)") if fa_rows else pd.DataFrame()
+
+    # 3. Whipsaw Count
+    full_idx = diag_full["active_sma"].index
+    pos_sub = full_idx.get_indexer(idx)
+    atk_r = diag_full["active_atk_r"].to_numpy(dtype=float)[pos_sub]
+    safe_r = diag_full["active_safe_r"].to_numpy(dtype=float)[pos_sub]
+    years = max(len(idx) / 252.0, 1e-6)
+    wh_rows = []
+    for s_col, s_lab in [
+        ("REBAND_QONLY_200_0", "本系統外層斷路器 Q=0 (全清倉)"),
+        ("O_Q4_200_0", "舊版 252 日分位數二元開關 G=0"),
+    ]:
+        g_mat = diag_full["active_gate"][s_col][:, pos_sub]
+        tot_ev, w5, w10, w20, fa_cnt = 0, 0, 0, 0, 0
+        durs = []
+        for ph in range(g_mat.shape[0]):
+            off = g_mat[ph] < 0.5
+            in_off, s_i = False, 0
+            for i in range(len(off)):
+                if (not in_off) and off[i]:
+                    in_off, s_i = True, i
+                elif in_off and (not off[i]):
+                    dur = i - s_i
+                    tot_ev += 1
+                    durs.append(dur)
+                    if dur <= 5: w5 += 1
+                    if dur <= 10: w10 += 1
+                    if dur <= 20: w20 += 1
+                    if (np.prod(1.0 + atk_r[s_i:i]) - 1.0) > (np.prod(1.0 + safe_r[s_i:i]) - 1.0):
+                        fa_cnt += 1
+                    in_off = False
+            if in_off:
+                dur = len(off) - s_i
+                tot_ev += 1
+                durs.append(dur)
+                if (np.prod(1.0 + atk_r[s_i:]) - 1.0) > (np.prod(1.0 + safe_r[s_i:]) - 1.0):
+                    fa_cnt += 1
+        avg_ev = tot_ev / g_mat.shape[0]
+        wh_rows.append({
+            "開關機制": s_lab,
+            "單相位平均觸發次數": round(avg_ev, 2),
+            "年均頻率(次/年)": round(avg_ev / years, 2),
+            "10日內洗盤": round(w10 / g_mat.shape[0], 2),
+            "20日內洗盤": round(w20 / g_mat.shape[0], 2),
+            "事後誤殺率(%)": round((fa_cnt / max(1, tot_ev)) * 100.0, 1),
+            "平均防禦天數": round(float(np.mean(durs)), 1) if durs else 0.0,
+        })
+    wh_df = pd.DataFrame(wh_rows).set_index("開關機制")
+    return ca_df, fa_df, wh_df
+
+
 # ==========================================
-# 6. 主畫面渲染：五大實用分頁
+# 7. 主畫面渲染：五大實用分頁
 # ==========================================
-st.title("🛡️ REBAND_HF0_200_0 機構實盤部署與超長歷史量化回測系統")
+st.title("🛡️ REBAND_QONLY_200_0 機構實盤部署與無近似量化回測系統")
 st.caption(
-    "整合：單一帳戶匯總下單指令 ｜ 進攻與避險統一四等分日曆季度 (0,3,6,9,12)/Vol252 動能 ＋ 月度 SMA6 ｜ "
-    "5 相位 Student-t GARCH(1,1) 與 200/0 bps 護欄監控 ｜ 三階段盤後即時收盤價補齊"
+    "整合：已拔除冗餘內層 a (B = Q × (0.5·SMA6 + 0.5)) ｜ 四等分標準日曆季度 (0,3,6,9,12)/Vol252 ｜ "
+    "100% 無近似 5 相位 Student-t GARCH(1,1) ＋ 200/0 bps 護欄 ｜ 黃金代理修正為 GC=F ｜ 美東收盤防呆"
 )
 
-closes_df, opens_df, rf_series, patch_source_note = get_live_market_bundle()
+closes_df, opens_df, rf_series, patch_source_note, dropped_unclosed_flag = build_clean_live_market_bundle(NOW_NY)
 
 if not closes_df.empty:
+    if dropped_unclosed_flag:
+        st.warning(
+            f"⏳ **美股盤中防呆啟動**：目前為美東交易時段 ({NOW_NY.strftime('%Y-%m-%d %H:%M %Z')})，"
+            f"系統已自動排除尚未收盤之當日盤中報價，所有下單與風控訊號嚴格鎖定於上一已收盤交易日 `{closes_df.index[-1].strftime('%Y-%m-%d')}`。"
+        )
+
     last_dt_str = closes_df.index[-1].strftime("%Y-%m-%d")
-    m_sig, phase_records = run_5phase_live_reband_replay(closes_df, opens_df, FORCE_EOM, last_dt_str)
+    m_sig = calculate_monthly_signals_1x(closes_df, NOW_NY, FORCE_EOM)
+
+    # 載入或計算無近似 5 相位 Student-t GARCH(1,1)
+    trigger_full_compute = st.session_state.pop("request_full_garch_compute", False)
+    vol_5ph, has_full_exact_garch, garch_fit_pos, garch_status_msg = get_exact_garch_5ph_for_session(
+        closes_df, build_full_now=trigger_full_compute
+    )
+    q_5ph, med_5ph, g_o_5ph = build_strict_gate_matrices(closes_df.index, vol_5ph)
+
+    # 執行單一真相引擎（有完整 25 年快取時由 2001-09-04 連續回放；無快取時由近 1.5 年無截斷暖機後連續回放）
+    replay_start_str = "2001-09-04" if has_full_exact_garch else closes_df.index[max(0, len(closes_df) - 360)].strftime("%Y-%m-%d")
+    bt_full_df, diag_full, phase_records = run_unified_reband_qonly_engine(
+        closes_df,
+        opens_df,
+        rf_series,
+        m_sig,
+        vol_5ph,
+        q_5ph,
+        med_5ph,
+        g_o_5ph,
+        start_date_str=replay_start_str,
+        fee_bps=FEE_BPS,
+        compute_benchmarks=has_full_exact_garch,
+    )
+
     sel_df = m_sig["sel_df"]
     safe_df = m_sig["safe_df"]
     ref_date = m_sig["ref_date"]
@@ -1103,9 +1312,10 @@ if not closes_df.empty:
     s_now_int = int(phase_records[0]["SMA6"])
 
     st.info(
-        f"📅 **月度訊號鎖定日**: `{ref_date.strftime('%Y-%m-%d')}` ｜ "
-        f"📈 **最新日頻收盤數據**: `{last_dt_str}` ({patch_source_note}) ｜ "
-        f"🎯 **下一交易日開盤執行標的**: 進攻 **`{winner_3x}`** (訊號源 `{MAPPING[winner_3x]}`) ＋ 防禦 **`{safe_win}`**"
+        f"📅 **月度訊號鎖定日 (美東完結基準)**: `{ref_date.strftime('%Y-%m-%d')}` ｜ "
+        f"📈 **最新已收盤數據**: `{last_dt_str}` ({patch_source_note}) ｜ "
+        f"🎯 **下一交易日開盤執行標的**: 進攻 **`{winner_3x}`** (`{MAPPING[winner_3x]}`) ＋ 防禦 **`{safe_win}`**\n\n"
+        f"⚙️ **GARCH 引擎狀態**: `{garch_status_msg}`"
     )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -1122,10 +1332,10 @@ if not closes_df.empty:
 
     tab_live, tab_bt, tab_doc, tab_rot, tab_raw = st.tabs([
         "💳 1. 單一帳戶實盤下單與五相位監控",
-        "📈 2. 最長歷史量化回測與滾動圖表 (1998–至今)",
+        "📈 2. 無近似超長歷史回測與機構避險報表 (2001–至今)",
         "📖 3. 策略架構與數學規格說明書",
         "📊 4. 當月 1x 四季動能排名與歷史輪動紀錄",
-        "🗄️ 5. 原始報價與系統健康檢查",
+        "🗄️ 5. 原始報價、無近似快取管理與健康檢查",
     ])
 
     # ==========================================
@@ -1206,7 +1416,7 @@ if not closes_df.empty:
         st.subheader("💳 單一帳戶匯總下單指令表")
         st.dataframe(pd.DataFrame(order_rows).set_index("ETF 代號"), use_container_width=True)
 
-        st.subheader("🔬 五相位 (Phase 0..4) GARCH 波動率與 200/0 bps 護欄明細")
+        st.subheader("🔬 五相位 (Phase 0..4) 無近似 Student-t GARCH 與 200/0 bps 護欄明細")
         disp_rows = []
         for r in phase_records:
             act_map = {
@@ -1222,7 +1432,6 @@ if not closes_df.empty:
                 "警報比 ρ": r["Rho_Ratio"],
                 "Q 危機閘門": r["Q_Gate"],
                 "SMA6 趨勢": r["SMA6"],
-                "a 縮放 (θ=41%)": r["a_Scalar"],
                 f"基礎目標 {winner_3x} (%)": round(r["Base_Stock_Weight"] * 100.0, 2),
                 f"昨收實際 {winner_3x} (%)": round(r["Prior_Close_Weights"][winner_3x] * 100.0, 2),
                 "最大偏離 d_max (bps)": r["Decision_Distance_bps"],
@@ -1232,383 +1441,267 @@ if not closes_df.empty:
             })
         st.dataframe(pd.DataFrame(disp_rows).set_index("相位 (Phase)"), use_container_width=True)
 
-        with st.expander("🧪 壓力測試模擬器：如果今晚輪值的相位遇到波動率飆升，我的單一帳戶明天會怎麼動？"):
-            sim_c1, sim_c2 = st.columns(2)
-            with sim_c1:
-                sim_sigma = st.slider("假設今日輪值相位的 1x 預測年化波動率 σ (%)", 10.0, 85.0, 58.0, 1.0)
-            with sim_c2:
-                sim_rho = st.slider("假設今日輪值相位的波動率警報比 ρ = σ / Med252", 0.8, 3.5, 2.1, 0.1)
+        with st.expander("🧪 壓力測試模擬器：如果今晚輪值相位觸發危機斷路器 Q=0，我的單一帳戶明天會怎麼動？"):
+            sim_rho = st.slider("假設今日輪值相位的波動率警報比 ρ = σ / Med252 (門檻 2.50)", 0.8, 3.5, 2.6, 0.1)
             sim_q = 0.0 if sim_rho >= RHO_EXIT else 1.0
-            sim_a = min(1.0, (THETA_VOL_PCT / sim_sigma) ** 2)
-            sim_b = sim_q * (0.5 * float(s_now_int) + 0.5 * sim_a)
+            sim_b = sim_q * (0.5 * float(s_now_int) + 0.5)
             new_acct_stock_w = 0.80 * avg_base_stock + 0.20 * sim_b
             delta_stock_w = new_acct_stock_w - avg_base_stock
             delta_usd = delta_stock_w * ACCOUNT_NAV
             st.markdown(
                 f"- **該輪值相位狀態**：`Q = {int(sim_q)}` ({'觸發危機全退！' if sim_q==0 else '安全維持 1'}) ｜ "
-                f"平方縮放係數 `a = {sim_a:.4f}` ｜ 該相位股票目標降至 **`{sim_b*100:.2f}%`**（觸發 `Action = 2` 強制減碼覆蓋！）\n"
-                f"- **對你單一帳戶 (總淨值 `${ACCOUNT_NAV:,.0f}`) 的匯總影響**：帳戶總 `{winner_3x}` 目標由 `{avg_base_stock*100:.2f}%` 降至 **`{new_acct_stock_w*100:.2f}%`** "
-                f"👉 明日開盤只需 **賣出 `{winner_3x}` `${abs(delta_usd):,.0f} USD`（約 `{abs(delta_usd)/latest_prices[winner_3x]:.1f}` 股）並買進等額 `{safe_win}`**！"
+                f"該相位股票目標變為 **`{sim_b*100:.1f}%`** (`REBAND_QONLY_200_0` 離散三檔：100% / 50% / 0%)\n"
+                f"- **對單一帳戶 (總淨值 `${ACCOUNT_NAV:,.0f}`) 的匯總影響**：帳戶總 `{winner_3x}` 目標由 `{avg_base_stock*100:.2f}%` 變為 **`{new_acct_stock_w*100:.2f}%`** "
+                f"👉 明日開盤需調整 `{winner_3x}` `${delta_usd:+,.0f} USD`（約 `{abs(delta_usd)/latest_prices[winner_3x]:.1f}` 股）並反向等額調整 `{safe_win}`。"
             )
 
     # ==========================================
-    # 分頁 2：最長歷史量化回測與滾動圖表 (1998–至今)
+    # 分頁 2：無近似超長歷史回測與機構避險三指標 (2001–至今)
     # ==========================================
     with tab_bt:
-        bt_full_df, hist_rot_df = run_ultra_long_history_backtest(
-            closes_df, opens_df, rf_series, FEE_BPS, last_dt_str
-        )
-
-        st.subheader("⏱️ 選擇歷史回測檢視區間與座標模式")
-        ctrl1, ctrl2 = st.columns([2, 1])
-        with ctrl1:
-            period_choice = st.radio(
-                "回測時間跨度",
-                options=[
-                    "🌐 最長歷史全週期 (1998–至今，約 28 年：含 2000 科技泡沫、2008 金融海嘯、2020 熔斷、2022 升息)",
-                    "🏛️ 實盤 3x ETF 完整週期 (2014-01-23–至今：真實 UPRO/EURL/EDC 上市後微結構)",
-                    "🔟 近 10 年完整週期 (Last 10 Years)",
-                    "5️⃣ 近 5 年完整週期 (Last 5 Years)",
-                ],
-                index=0,
-                horizontal=False,
+        if not has_full_exact_garch:
+            st.warning(
+                "🚫 **為杜絕假近似回測誤導，本系統已永久移除原版 MAD 固定係數近似引擎！**\n\n"
+                f"目前專案根目錄尚未偵測到無近似 25 年快取檔 `{DEFAULT_GARCH_CACHE_FILE}`。請擇一啟用 100% 無近似歷史回測：\n"
+                "1. **推薦（秒開）**：將您在 Colab 跑好的 `reband_exact_garch_5phase_cache.npz` 提交至 GitHub 根目錄，或在下方直接暫時上傳檢視。\n"
+                "2. **一次性現算**：點擊下方按鈕執行完整 2000–至今真實 `arch_model` 擬合（約 2～4 分鐘），完成後到分頁 5 下載 `.npz` 放入 GitHub 即可永久秒開。"
             )
-        with ctrl2:
-            scale_type = st.radio(
-                "淨值曲線縱軸座標",
-                options=["log (對數座標：最適合檢視長期複利斜率)", "linear (線性座標：檢視絕對資產倍數)"],
-                index=0,
-            )
-            use_log = scale_type.startswith("log")
-
-        if period_choice.startswith("🏛️"):
-            bt_sub = bt_full_df.loc[bt_full_df.index >= pd.Timestamp("2014-01-23")].copy()
-        elif period_choice.startswith("🔟"):
-            bt_sub = bt_full_df.tail(252 * 10).copy()
-        elif period_choice.startswith("5️⃣"):
-            bt_sub = bt_full_df.tail(252 * 5).copy()
+            col_u1, col_u2 = st.columns(2)
+            with col_u1:
+                up_file = st.file_uploader("📤 暫時上傳無近似快取檔 (.npz)", type=["npz"])
+                if up_file is not None:
+                    st.session_state["uploaded_garch_npz_bytes"] = up_file.getvalue()
+                    st.session_state.pop("exact_garch_runtime_mem", None)
+                    st.rerun()
+            with col_u2:
+                st.write("")
+                st.write("")
+                if st.button("⚙️ 立即執行 2000–至今 100% 無近似 GARCH 全量擬合 (約 2~4 分鐘)"):
+                    st.session_state["request_full_garch_compute"] = True
+                    st.rerun()
         else:
-            bt_sub = bt_full_df.copy()
+            st.subheader("⏱️ 選擇歷史回測檢視區間與座標模式 (100% 無近似 Student-t GARCH)")
+            ctrl1, ctrl2 = st.columns([2, 1])
+            with ctrl1:
+                period_choice = st.radio(
+                    "回測時間跨度",
+                    options=[
+                        "🏛️ 純實盤 3x ETF 完整期 (2014-01-23–至今：100% 真實 ETF Open/Close，零代理誤差)",
+                        "🌐 無金礦股長週期 (2001-09-04–至今，約 25 年：GLD 以 GC=F 銜接；2014 前 3x 因果合成)",
+                        "🔟 近 10 年完整週期 (Last 10 Years)",
+                        "5️⃣ 近 5 年完整週期 (Last 5 Years)",
+                    ],
+                    index=0,
+                    horizontal=False,
+                )
+            with ctrl2:
+                scale_type = st.radio(
+                    "淨值曲線縱軸座標",
+                    options=["log (對數座標：檢視長期複利斜率)", "linear (線性座標：檢視絕對資產倍數)"],
+                    index=0,
+                )
+                use_log = scale_type.startswith("log")
 
-        st.caption(
-            f"📌 目前檢視區間：`{bt_sub.index[0].strftime('%Y-%m-%d')}` 至 `{bt_sub.index[-1].strftime('%Y-%m-%d')}` "
-            f"（共 `{len(bt_sub):,}` 個交易日，約 `{len(bt_sub)/252.0:.1f}` 年 ｜ 單邊交易成本設定：`{FEE_BPS} bps`）"
-        )
+            if period_choice.startswith("🏛️"):
+                bt_sub = bt_full_df.loc[bt_full_df.index >= pd.Timestamp("2014-01-23")].copy()
+            elif period_choice.startswith("🔟"):
+                bt_sub = bt_full_df.tail(252 * 10).copy()
+            elif period_choice.startswith("5️⃣"):
+                bt_sub = bt_full_df.tail(252 * 5).copy()
+            else:
+                bt_sub = bt_full_df.copy()
 
-        # 1. 量化常用指標總表
-        st.markdown("#### 📊 1. 機構級量化績效指標總表 (Quantitative Performance Summary)")
-        metrics_tbl = compute_quant_metrics_table(bt_sub, FEE_BPS)
-        st.dataframe(metrics_tbl, use_container_width=True)
-
-        nav_df = pd.DataFrame(index=bt_sub.index)
-        dd_df = pd.DataFrame(index=bt_sub.index)
-        label_map = {
-            "REBAND_HF0_200_0": "1. REBAND_HF0_200_0 (本系統：200/0 bps)",
-            "SCOPE_HALF_F0": "2. SCOPE_HALF_F0 (無護欄)",
-            "Strategy_O": "3. 原版策略 O",
-            "SPY_1x": "4. SPY (1x 標普500)",
-        }
-        for col, lab in label_map.items():
-            r_arr = bt_sub[col].to_numpy(dtype=float)
-            nav_s = np.cumprod(1.0 + r_arr)
-            peak_s = np.maximum.accumulate(nav_s)
-            nav_df[lab] = nav_s
-            dd_df[lab] = ((nav_s / peak_s) - 1.0) * 100.0
-
-        plot_step = max(1, len(bt_sub) // 1400)
-        sample_idx = bt_sub.index[::plot_step].union(bt_sub.index[-1:])
-
-        # 2. 累積淨值變化圖 (Equity Curve)
-        st.markdown("#### 📈 2. 累積淨值變化圖 (Cumulative Equity Curve, 初始資金 = 1.0)")
-        nav_long = (
-            nav_df.loc[sample_idx]
-            .reset_index()
-            .rename(columns={"index": "Date", bt_sub.index.name or "index": "Date"})
-        )
-        date_col = nav_long.columns[0]
-        nav_long = nav_long.rename(columns={date_col: "Date"}).melt("Date", var_name="策略", value_name="累積淨值 (倍)")
-
-        y_scale = alt.Scale(type="log") if use_log else alt.Scale(type="linear")
-        chart_nav = (
-            alt.Chart(nav_long)
-            .mark_line(strokeWidth=2.0)
-            .encode(
-                x=alt.X("Date:T", title="年份"),
-                y=alt.Y("累積淨值 (倍):Q", scale=y_scale, title="累積淨值倍數 (Log 對數座標)" if use_log else "累積淨值倍數 (線性)"),
-                color=alt.Color(
-                    "策略:N",
-                    scale=alt.Scale(
-                        domain=list(label_map.values()),
-                        range=["#d9534f", "#f0ad4e", "#0275d8", "#6c757d"],
-                    ),
-                ),
-                tooltip=[
-                    alt.Tooltip("Date:T", title="日期", format="%Y-%m-%d"),
-                    alt.Tooltip("策略:N", title="策略"),
-                    alt.Tooltip("累積淨值 (倍):Q", title="淨值倍數", format=",.2f"),
-                ],
+            st.caption(
+                f"📌 目前檢視區間：`{bt_sub.index[0].strftime('%Y-%m-%d')}` 至 `{bt_sub.index[-1].strftime('%Y-%m-%d')}` "
+                f"（共 `{len(bt_sub):,}` 個交易日，約 `{len(bt_sub)/252.0:.2f}` 年 ｜ 單邊交易成本：`{FEE_BPS} bps` ｜ 5 相位獨立子帳戶核算）"
             )
-            .properties(height=420)
-            .interactive()
-        )
-        st.altair_chart(chart_nav, use_container_width=True)
 
-        # 3. 水下回撤圖 (Underwater Drawdown Chart)
-        st.markdown("#### 🌊 3. 歷史水下回撤圖 (Underwater MaxDD Curve %)")
-        dd_long = (
-            dd_df.loc[sample_idx]
-            .reset_index()
-            .rename(columns={dd_df.index.name or "index": "Date"})
-        )
-        dd_long = dd_long.rename(columns={dd_long.columns[0]: "Date"}).melt("Date", var_name="策略", value_name="水下回撤 (%)")
+            # 1. 機構級績效總表
+            st.markdown("#### 📊 1. 機構級量化績效指標總表 (無近似 Student-t GARCH)")
+            metrics_tbl = compute_quant_metrics_table(bt_sub, FEE_BPS)
+            st.dataframe(metrics_tbl, use_container_width=True)
 
-        chart_dd = (
-            alt.Chart(dd_long)
-            .mark_line(strokeWidth=1.6)
-            .encode(
-                x=alt.X("Date:T", title="年份"),
-                y=alt.Y("水下回撤 (%):Q", title="自歷史高點回撤幅度 (%)"),
-                color=alt.Color(
-                    "策略:N",
-                    scale=alt.Scale(
-                        domain=list(label_map.values()),
-                        range=["#d9534f", "#f0ad4e", "#0275d8", "#6c757d"],
-                    ),
-                ),
-                tooltip=[
-                    alt.Tooltip("Date:T", title="日期", format="%Y-%m-%d"),
-                    alt.Tooltip("策略:N", title="策略"),
-                    alt.Tooltip("水下回撤 (%):Q", title="回撤 (%)", format=".2f"),
-                ],
+            # 2. 避險模塊三大強制機構報表
+            st.markdown("#### 🛡️ 2. 避險模塊三大強制風控報表 (Crisis Alpha / False Alarm Drag / Whipsaw Count)")
+            ca_df, fa_df, wh_df = compute_institutional_hedge_reports(bt_sub, diag_full)
+            if not ca_df.empty:
+                st.caption("A. Crisis Alpha（特定股災防禦力，基準 = 無波動開關 NO_VOL_GATE）")
+                st.dataframe(ca_df, use_container_width=True)
+            hc1, hc2 = st.columns(2)
+            with hc1:
+                if not fa_df.empty:
+                    st.caption("B. False Alarm Drag（多頭出血率）")
+                    st.dataframe(fa_df, use_container_width=True)
+            with hc2:
+                st.caption("C. Whipsaw Count（假訊號洗盤與事後誤殺率）")
+                st.dataframe(wh_df, use_container_width=True)
+
+            # 3. 累積淨值與水下回撤圖
+            label_map = {
+                "REBAND_QONLY_200_0": "1. REBAND_QONLY_200_0 (本系統)",
+                "SCOPE_QONLY_F0": "2. SCOPE_QONLY_F0 (無護欄)",
+                "O_Q4_200_0": "3. 公平舊版 O_Q4_200_0",
+                "NO_VOL_GATE": "4. NO_VOL_GATE (無波動開關)",
+                "SPY_1x": "5. SPY (1x 標普500)",
+            }
+            color_range = ["#d9534f", "#f0ad4e", "#0275d8", "#5cb85c", "#6c757d"]
+
+            nav_df = pd.DataFrame(index=bt_sub.index)
+            dd_df = pd.DataFrame(index=bt_sub.index)
+            for col, lab in label_map.items():
+                nav_s = np.cumprod(1.0 + bt_sub[col].to_numpy(dtype=float))
+                nav_df[lab] = nav_s
+                dd_df[lab] = ((nav_s / np.maximum.accumulate(nav_s)) - 1.0) * 100.0
+
+            plot_step = max(1, len(bt_sub) // 1400)
+            sample_idx = bt_sub.index[::plot_step].union(bt_sub.index[-1:])
+
+            st.markdown("#### 📈 3. 累積淨值變化圖 (Cumulative Equity Curve, 初始資金 = 1.0)")
+            nav_long = nav_df.loc[sample_idx].reset_index()
+            nav_long = nav_long.rename(columns={nav_long.columns[0]: "Date"}).melt("Date", var_name="策略", value_name="累積淨值 (倍)")
+            chart_nav = (
+                alt.Chart(nav_long)
+                .mark_line(strokeWidth=2.0)
+                .encode(
+                    x=alt.X("Date:T", title="年份"),
+                    y=alt.Y("累積淨值 (倍):Q", scale=alt.Scale(type="log" if use_log else "linear")),
+                    color=alt.Color("策略:N", scale=alt.Scale(domain=list(label_map.values()), range=color_range)),
+                    tooltip=[
+                        alt.Tooltip("Date:T", title="日期", format="%Y-%m-%d"),
+                        alt.Tooltip("策略:N", title="策略"),
+                        alt.Tooltip("累積淨值 (倍):Q", title="淨值倍數", format=",.2f"),
+                    ],
+                )
+                .properties(height=420)
+                .interactive()
             )
-            .properties(height=340)
-            .interactive()
-        )
-        st.altair_chart(chart_dd, use_container_width=True)
+            st.altair_chart(chart_nav, use_container_width=True)
 
-        # 4. 5 年與 10 年滾動年化報酬率 (5Y & 10Y Rolling CAGR)
-        st.markdown("#### 🔄 4. 5 年與 10 年滾動年化複合報酬率 (5-Year & 10-Year Rolling CAGR %)")
-        st.caption("衡量『在歷史上任何一天進場並持有滿 5 年（1,260 個交易日）或 10 年（2,520 個交易日）』的年化複合報酬率表現。")
-
-        full_nav_df = pd.DataFrame(index=bt_full_df.index)
-        for col, lab in label_map.items():
-            full_nav_df[lab] = np.cumprod(1.0 + bt_full_df[col].to_numpy(dtype=float))
-
-        roll_5y_df = ((full_nav_df / full_nav_df.shift(252 * 5)) ** (1.0 / 5.0) - 1.0) * 100.0
-        roll_10y_df = ((full_nav_df / full_nav_df.shift(252 * 10)) ** (1.0 / 10.0) - 1.0) * 100.0
-
-        rc1, rc2 = st.columns(2)
-        with rc1:
-            r5_sub = roll_5y_df.dropna(how="all")
-            if not r5_sub.empty:
-                r5_idx = r5_sub.index[:: max(1, len(r5_sub) // 900)].union(r5_sub.index[-1:])
-                r5_long = r5_sub.loc[r5_idx].reset_index()
-                r5_long = r5_long.rename(columns={r5_long.columns[0]: "Date"}).melt(
-                    "Date", var_name="策略", value_name="5年滾動CAGR (%)"
+            st.markdown("#### 🌊 4. 歷史水下回撤圖 (Underwater Drawdown %)")
+            dd_long = dd_df.loc[sample_idx].reset_index()
+            dd_long = dd_long.rename(columns={dd_long.columns[0]: "Date"}).melt("Date", var_name="策略", value_name="水下回撤 (%)")
+            chart_dd = (
+                alt.Chart(dd_long)
+                .mark_line(strokeWidth=1.6)
+                .encode(
+                    x=alt.X("Date:T", title="年份"),
+                    y=alt.Y("水下回撤 (%):Q", title="自歷史高點回撤幅度 (%)"),
+                    color=alt.Color("策略:N", scale=alt.Scale(domain=list(label_map.values()), range=color_range)),
+                    tooltip=[
+                        alt.Tooltip("Date:T", title="日期", format="%Y-%m-%d"),
+                        alt.Tooltip("策略:N", title="策略"),
+                        alt.Tooltip("水下回撤 (%):Q", title="回撤 (%)", format=".2f"),
+                    ],
                 )
-                zero_rule5 = alt.Chart(pd.DataFrame({"y": [0.0]})).mark_rule(strokeDash=[4, 4], color="black").encode(y="y:Q")
-                ch_r5 = (
-                    alt.Chart(r5_long)
-                    .mark_line(strokeWidth=1.8)
-                    .encode(
-                        x=alt.X("Date:T", title="滾動 5 年結束日"),
-                        y=alt.Y("5年滾動CAGR (%):Q", title="5 年滾動年化報酬 (%)"),
-                        color=alt.Color(
-                            "策略:N",
-                            scale=alt.Scale(
-                                domain=list(label_map.values()),
-                                range=["#d9534f", "#f0ad4e", "#0275d8", "#6c757d"],
-                            ),
-                        ),
-                        tooltip=[
-                            alt.Tooltip("Date:T", title="結束日期", format="%Y-%m-%d"),
-                            alt.Tooltip("策略:N", title="策略"),
-                            alt.Tooltip("5年滾動CAGR (%):Q", title="5Y CAGR (%)", format=".2f"),
-                        ],
-                    )
-                    .properties(title="📅 5-Year Rolling CAGR (%)", height=340)
-                    .interactive()
-                )
-                st.altair_chart(ch_r5 + zero_rule5, use_container_width=True)
+                .properties(height=340)
+                .interactive()
+            )
+            st.altair_chart(chart_dd, use_container_width=True)
 
-        with rc2:
-            r10_sub = roll_10y_df.dropna(how="all")
-            if not r10_sub.empty:
-                r10_idx = r10_sub.index[:: max(1, len(r10_sub) // 900)].union(r10_sub.index[-1:])
-                r10_long = r10_sub.loc[r10_idx].reset_index()
-                r10_long = r10_long.rename(columns={r10_long.columns[0]: "Date"}).melt(
-                    "Date", var_name="策略", value_name="10年滾動CAGR (%)"
-                )
-                zero_rule10 = alt.Chart(pd.DataFrame({"y": [0.0]})).mark_rule(strokeDash=[4, 4], color="black").encode(y="y:Q")
-                ch_r10 = (
-                    alt.Chart(r10_long)
-                    .mark_line(strokeWidth=1.8)
-                    .encode(
-                        x=alt.X("Date:T", title="滾動 10 年結束日"),
-                        y=alt.Y("10年滾動CAGR (%):Q", title="10 年滾動年化報酬 (%)"),
-                        color=alt.Color(
-                            "策略:N",
-                            scale=alt.Scale(
-                                domain=list(label_map.values()),
-                                range=["#d9534f", "#f0ad4e", "#0275d8", "#6c757d"],
-                            ),
-                        ),
-                        tooltip=[
-                            alt.Tooltip("Date:T", title="結束日期", format="%Y-%m-%d"),
-                            alt.Tooltip("策略:N", title="策略"),
-                            alt.Tooltip("10年滾動CAGR (%):Q", title="10Y CAGR (%)", format=".2f"),
-                        ],
-                    )
-                    .properties(title="🏛️ 10-Year Rolling CAGR (%)", height=340)
-                    .interactive()
-                )
-                st.altair_chart(ch_r10 + zero_rule10, use_container_width=True)
+            # 5. 5Y & 10Y 滾動年化報酬率
+            st.markdown("#### 🔄 5. 5 年與 10 年滾動年化複合報酬率 (Rolling CAGR %)")
+            full_nav_df = pd.DataFrame(
+                {lab: np.cumprod(1.0 + bt_full_df[col].to_numpy(dtype=float)) for col, lab in label_map.items()},
+                index=bt_full_df.index,
+            )
+            roll_5y_df = ((full_nav_df / full_nav_df.shift(252 * 5)) ** (1.0 / 5.0) - 1.0) * 100.0
+            roll_10y_df = ((full_nav_df / full_nav_df.shift(252 * 10)) ** (1.0 / 10.0) - 1.0) * 100.0
 
-        roll_stat_rows = []
-        for lab in label_map.values():
-            s5 = roll_5y_df[lab].dropna()
-            s10 = roll_10y_df[lab].dropna()
-            roll_stat_rows.append({
-                "策略名稱": lab,
-                "5Y 滾動 CAGR 中位數": f"{s5.median():.2f}%" if not s5.empty else "N/A",
-                "5Y 滾動 CAGR 最差 (Min)": f"{s5.min():.2f}%" if not s5.empty else "N/A",
-                "5Y 滾動 CAGR 最佳 (Max)": f"{s5.max():.2f}%" if not s5.empty else "N/A",
-                "5Y 正報酬勝率": f"{(s5 > 0).mean()*100:.1f}%" if not s5.empty else "N/A",
-                "10Y 滾動 CAGR 中位數": f"{s10.median():.2f}%" if not s10.empty else "N/A",
-                "10Y 滾動 CAGR 最差 (Min)": f"{s10.min():.2f}%" if not s10.empty else "N/A",
-                "10Y 滾動 CAGR 最佳 (Max)": f"{s10.max():.2f}%" if not s10.empty else "N/A",
-                "10Y 正報酬勝率": f"{(s10 > 0).mean()*100:.1f}%" if not s10.empty else "N/A",
-            })
-        st.dataframe(pd.DataFrame(roll_stat_rows).set_index("策略名稱"), use_container_width=True)
+            rc1, rc2 = st.columns(2)
+            for col_ui, r_df, ttl, y_lab in [
+                (rc1, roll_5y_df, "📅 5-Year Rolling CAGR (%)", "5年滾動CAGR (%)"),
+                (rc2, roll_10y_df, "🏛️ 10-Year Rolling CAGR (%)", "10年滾動CAGR (%)"),
+            ]:
+                with col_ui:
+                    r_sub = r_df.dropna(how="all")
+                    if not r_sub.empty:
+                        r_idx = r_sub.index[:: max(1, len(r_sub) // 900)].union(r_sub.index[-1:])
+                        r_long = r_sub.loc[r_idx].reset_index()
+                        r_long = r_long.rename(columns={r_long.columns[0]: "Date"}).melt("Date", var_name="策略", value_name=y_lab)
+                        zero_rule = alt.Chart(pd.DataFrame({"y": [0.0]})).mark_rule(strokeDash=[4, 4], color="black").encode(y="y:Q")
+                        ch_r = (
+                            alt.Chart(r_long)
+                            .mark_line(strokeWidth=1.8)
+                            .encode(
+                                x=alt.X("Date:T", title="滾動結束日"),
+                                y=alt.Y(f"{y_lab}:Q", title=y_lab),
+                                color=alt.Color("策略:N", scale=alt.Scale(domain=list(label_map.values()), range=color_range)),
+                                tooltip=[
+                                    alt.Tooltip("Date:T", title="日期", format="%Y-%m-%d"),
+                                    alt.Tooltip("策略:N", title="策略"),
+                                    alt.Tooltip(f"{y_lab}:Q", title=y_lab, format=".2f"),
+                                ],
+                            )
+                            .properties(title=ttl, height=340)
+                            .interactive()
+                        )
+                        st.altair_chart(ch_r + zero_rule, use_container_width=True)
 
-        # 5. 歷年年度報酬對照表 (Annual Calendar Returns)
-        st.markdown("#### 📅 5. 歷年年度報酬率對照表 (Annual Calendar Returns %)")
-        ann_rows = []
-        for yr, grp in bt_sub.groupby(bt_sub.index.year):
-            r_reb_y = float(np.prod(1.0 + grp["REBAND_HF0_200_0"].to_numpy()) - 1.0) * 100.0
-            r_hf0_y = float(np.prod(1.0 + grp["SCOPE_HALF_F0"].to_numpy()) - 1.0) * 100.0
-            r_o_y = float(np.prod(1.0 + grp["Strategy_O"].to_numpy()) - 1.0) * 100.0
-            r_spy_y = float(np.prod(1.0 + grp["SPY_1x"].to_numpy()) - 1.0) * 100.0
-            ann_rows.append({
-                "年份": str(yr),
-                "REBAND_HF0_200_0 (%)": round(r_reb_y, 2),
-                "SCOPE_HALF_F0 (%)": round(r_hf0_y, 2),
-                "原版策略 O (%)": round(r_o_y, 2),
-                "SPY 1x (%)": round(r_spy_y, 2),
-                "REBAND 超額報酬 vs O (pp)": round(r_reb_y - r_o_y, 2),
-                "REBAND 免交易日比例 (%)": round(float(grp["Skip_Frac_REBAND"].mean()) * 100.0, 1),
-            })
-        st.dataframe(pd.DataFrame(ann_rows[::-1]).set_index("年份"), use_container_width=True)
+            # 6. 歷年年度報酬對照表
+            st.markdown("#### 📅 6. 歷年年度報酬率對照表 (Annual Calendar Returns %)")
+            ann_rows = []
+            for yr, grp in bt_sub.groupby(bt_sub.index.year):
+                r_q = float(np.prod(1.0 + grp["REBAND_QONLY_200_0"].to_numpy()) - 1.0) * 100.0
+                r_o = float(np.prod(1.0 + grp["O_Q4_200_0"].to_numpy()) - 1.0) * 100.0
+                r_nv = float(np.prod(1.0 + grp["NO_VOL_GATE"].to_numpy()) - 1.0) * 100.0
+                r_spy = float(np.prod(1.0 + grp["SPY_1x"].to_numpy()) - 1.0) * 100.0
+                ann_rows.append({
+                    "年份": str(yr),
+                    "REBAND_QONLY (%)": round(r_q, 2),
+                    "公平舊版 O (%)": round(r_o, 2),
+                    "無波動開關 (%)": round(r_nv, 2),
+                    "SPY 1x (%)": round(r_spy, 2),
+                    "本系統 vs 舊版 O (pp)": round(r_q - r_o, 2),
+                    "本系統免交易日 (%)": round(float(grp["SKIP_REBAND_QONLY_200_0"].mean()) * 100.0, 1),
+                })
+            st.dataframe(pd.DataFrame(ann_rows[::-1]).set_index("年份"), use_container_width=True)
 
     # ==========================================
-    # 分頁 3：策略架構與數學規格說明書
+    # 分頁 3：策略架構與數學規格說明書 (同步更新為凍結版 REBAND_QONLY_200_0)
     # ==========================================
     with tab_doc:
-        st.subheader("📖 REBAND_HF0_200_0 與 SCOPE_HALF_F0 策略完整架構與數學規格說明書")
+        st.subheader("📖 REBAND_QONLY_200_0 最終凍結規格與數學說明書")
         st.markdown(
             r"""
-### 一、 核心設計哲學與三代架構演進（`Strategy O` $\rightarrow$ `SCOPE_HALF_F0` $\rightarrow$ `REBAND_HF0_200_0`）
+### 一、 經 5 輪無近似消融審計後之最終凍結架構（`REBAND_QONLY_200_0`）
 
-本系統是針對全球三倍槓桿指數 ETF（美股 `UPRO`、歐股 `EURL`、新興市場 `EDC`）與防禦型資產（黃金 `GLD`、長天期美債 `TLT`）設計的**機構級全天候動態資產配置系統**。回測圖表中的三條核心策略曲線代表三代演進關係：
+本系統針對全球三倍槓桿指數 ETF（美股 `UPRO`、歐股 `EURL`、新興市場 `EDC`）與防禦型資產（黃金 `GLD`、長天期美債 `TLT`）設計，並已正式完成減法消融，**永久拔除冗餘之內層平方反比縮放器 $a_{p,t}$（移除 41% 與 2.0 兩參數）**，僅保留經無近似 5 相位 Student-$t$ $\text{GARCH}(1,1)$ 驗證之核心四模組：
 
-1. **第一代基準：`Strategy O`（舊版分位數二元閘門）**
-   - **架構**：月度 `SMA6` 佔 $50\%$ 權重 + 日頻 $\text{GARCH}(1,1)$ 過去 252 日分位數二元開關 $G_{p,t} \in \{0, 1\}$（突破 $97.5\%$ 分位數減半倉、跌回 $90\%$ 分位數恢復滿倉）佔 $50\%$ 權重。
-   - **結構瓶頸**：在 2020 年 3 月等系統性崩盤時，即使 $\text{GARCH}$ 觸發退出，在跌破月均線前仍會殘留 $50\%$ 的 3x ETF 部位承受暴跌；而在 V 型反轉初期，又因過去 252 日的歷史分位數被極端高波動墊高，導致遲遲無法重新進場（分位數鎖死效應）。
-2. **第二代純訊號核心：`SCOPE_HALF_F0`（無護欄每日精確調倉版）**
-   - **架構**：將進攻與避險動能統一為零自由參數的 **「四等分標準日曆季度 $(0,3,6,9,12)/\text{Vol}_{252}$」**，並將波動率控制拆解為 **「外層危機峰值回落斷路器 $Q_{p,t} \in \{0, 1\}$」** 與 **「內層常態平方反比連續縮放器 $a_{p,t} \in (0, 1]$」**，在每個交易日開盤 100% 精確交易至理論目標權重。
-   - **核心突破**：遇到相對波動率暴衝（$\rho_{p,t} \ge 2.5$）時直接將槓桿股票**瞬間歸零（$Q_{p,t}=0$）**，並在波動率自危機峰值回落 $40\%$ 時**立即在 V 轉底部重新進場（$Q_{p,t}=1$）**，徹底消除了 `O` 的分位數鎖死延遲。
-3. **第三代實盤旗艦版：`REBAND_HF0_200_0`（本系統：採用 `200 / 0 bps` 零殘差護欄 + 7 大強制減碼覆蓋）**
-   - **架構**：100% 繼承 `SCOPE_HALF_F0` 的訊號引擎，但在執行層加入 **「偏離 $< 200\text{ bps}$ 免交易（`Action = 0`）、偏離 $\ge 200\text{ bps}$ 直接一步歸位至 $0\text{ bps}$ 理論目標權重（`Action = 1`）、遇到任何訊號翻轉或目標股票預算下調時立即強制精確執行（`Action = 2`）」** 的非對稱護欄。
-   - **核心優勢**：相較於停在 $175\text{ bps}$ 邊界的緩衝設計，`200 / 0 bps` 一旦觸發調倉就一步到位歸零偏離，徹底消除邊界連環微調（免交易日比例高達 **$96.2\%$**，比 `200 / 175 bps` 再砍半調倉次數），且日常觸發護欄與強制覆蓋的目標公式完全統一為 $w^{\text{base}}_{p,t}$！
+1. **模組 1 — 進攻與避險統一四等分標準日曆季度動能（零自由參數）**：
+   每月美東收盤完結日，將過去 12 個月拆分為四個等長日曆季度 $(0,3]\text{M}$、$(3,6]\text{M}$、$(6,9]\text{M}$、$(9,12]\text{M}$，除以 252 日實現波動率取算術平均，分別選出 1x 進攻贏家（對應 3x 執行標的）與避險贏家（`GLD` 或 `TLT`）。
+2. **模組 2 — 月度 `SMA6` 加法半倉趨勢濾網**：
+   $S_t = \mathbb{I}(P_{L_t,m} > \text{SMA}_{6,m}) \in \{0, 1\}$。採加法半倉（跌破均線減至 50% 而非清倉），避免盤整期洗盤與 V 轉鎖死。
+3. **模組 3 — 五相位無近似 Student-$t$ $\text{GARCH}(1,1)$ 外層危機峰值回落斷路器 $Q_{p,t}$**：
+   每交易日僅輪值相位 $p \equiv (t - 504) \pmod 5$ 以 504 日 1x 報酬擬合真正 Student-$t$ $\text{GARCH}(1,1)$ 預測波動率 $\sigma_{p,t}$，並與嚴格因果之過去 252 日中位數比較警報比 $\rho_{p,t} = \sigma_{p,t} / \text{Med}_{252}(\sigma)_{p,t-1}$：
+   - **危機全退（$1 \to 0$）**：$\rho_{p,t} \ge 2.50$（復歸後再次觸發須同時滿足 $\sigma_{p,t} \ge 1.25 \cdot \sigma^{\text{trough}}_{p,t}$）。
+   - **解除／峰值回落復歸（$0 \to 1$）**：$\rho_{p,t} \le 1.25$ 或 $\sigma_{p,t} \le 0.60 \cdot \sigma^{\text{peak}}_{p,t}$。
 """
         )
-
-        st.divider()
-        st.markdown("### 二、 四大模組精確數學公式")
-
+        st.latex(r"B_{p,t} = Q_{p,t} \times \left( 0.5 \cdot S_t + 0.5 \right) \in \{100\%,\; 50\%,\; 0\%\}")
         st.markdown(
             r"""
-#### 模組 1：月底四等分標準日曆季度風險調整動能選股（進攻與避險 100% 統一公式）
-在每個月最後一個交易日收盤，對進攻端 1x 原型指數 ETF $i \in \{\text{SPY}, \text{VGK}, \text{EEM}\}$ 與防禦端避險資產 $d \in \{\text{GLD}, \text{TLT}\}$，統一將過去 12 個月拆分為**四個等長標準日曆季度** $(0,3]\text{M}$、$(3,6]\text{M}$、$(6,9]\text{M}$、$(9,12]\text{M}$，各季累積報酬率除以 252 日年化實現波動率 $\sigma^{(252)}_{m}$ 後取算術平均：
+4. **模組 4 — `200 / 0 bps` 零殘差成本走廊與強制覆蓋**：
+   - `Action = 2`（強制精確執行）：初始建倉、進攻標的換股、`SMA6` 翻轉、$Q_{p,t}$ 翻轉、避險標的換股、持倉集合改變、股票預算調降。
+   - `Action = 1`（護欄一步歸位）：無強制事件但最大權重偏離 $d_{\max} \ge 2.00\%$，一步拉回目標權重。
+   - `Action = 0`（免交易抱牢）：$d_{\max} < 2.00\%$，保留原股數不動。
+
+### 二、 無近似機構審計基準表（2026-11-23 Colab 實證鎖定）
 """
         )
-        st.latex(
-            r"\text{Score}_{m} = \frac{1}{4} \left( \frac{R^{(0,3)}_{m}}{\sigma^{(252)}_{m}} + \frac{R^{(3,6)}_{m}}{\sigma^{(252)}_{m}} + \frac{R^{(6,9)}_{m}}{\sigma^{(252)}_{m}} + \frac{R^{(9,12)}_{m}}{\sigma^{(252)}_{m}} \right)"
-        )
-        st.markdown(
-            r"""
-- **進攻端贏家 $L_t$**：$\{\text{SPY}, \text{VGK}, \text{EEM}\}$ 中 $\text{Score}_{i,m}$ 最高者之對應 3x 槓桿 ETF（$\text{SPY} \rightarrow \text{UPRO},\; \text{VGK} \rightarrow \text{EURL},\; \text{EEM} \rightarrow \text{EDC}$）。
-- **防禦端贏家 $D_t$**：$\{\text{GLD}, \text{TLT}\}$ 中 $\text{Score}_{d,m}$ 較高者。
-"""
-        )
-
-        st.markdown(
-            r"""
-#### 模組 2：月度 6 個月簡單移動平均趨勢濾網（$\text{SMA}_6$）
-在月底收盤檢驗勝出之 1x 原型收盤價是否嚴格大於過去 6 個月底收盤價均值：
-"""
-        )
-        st.latex(
-            r"S_t = \mathbb{I}\!\left( P_{L_t, m} > \frac{1}{6}\sum_{k=0}^{5} P_{L_t, m-k} \right) \in \{0, 1\}"
-        )
-
-        st.markdown(
-            r"""
-#### 模組 3：五相位交錯 Student-$t$ $\text{GARCH}(1,1)$ 與雙層波動率預算 $B_{p,t}$（`SCOPE_HALF_F0` 核心）
-將資金均分為 5 個獨立子相位 $p \in \{0, 1, 2, 3, 4\}$（各佔 $20\%$ 資金）。在交易日 $t$，僅輪值相位 $p \equiv (t - 504) \pmod 5$ 使用最新 504 日 1x 原型日報酬擬合 Student-$t$ $\text{GARCH}(1,1)$ 預測年化波動率 $\sigma_{p,t}$，並計算相對於過去 252 日預測中位數之警報比 $\rho_{p,t} = \sigma_{p,t} / \text{Med}_{252}(\sigma)_{p,t}$：
-
-- **外層危機峰值回落斷路器 $Q_{p,t} \in \{0, 1\}$**：
-  - **危機全退（$1 \rightarrow 0$）**：當 $\rho_{p,t} \ge 2.50$（且若為復歸後再次觸發，需同時滿足 $\sigma_{p,t} \ge 1.25 \cdot \sigma^{\text{trough}}_{p,t}$）時，令 $Q_{p,t} = 0$。
-  - **危機解除或峰值回落復歸（$0 \rightarrow 1$）**：在退出期間追蹤波動率峰值 $\sigma^{\text{peak}}_{p,t} = \max \sigma$；一旦 $\rho_{p,t} \le 1.25$ **或波動率自峰值回落達 $40\%$（$\sigma_{p,t} \le 0.60 \cdot \sigma^{\text{peak}}_{p,t}$）**，立即恢復 $Q_{p,t} = 1$。
-- **內層常態平方反比縮放器 $a_{p,t} \in (0, 1]$ 與基礎股票預算 $B_{p,t}$**：
-"""
-        )
-        st.latex(
-            r"a_{p,t} = \min\!\left(1,\; \left(\frac{41\%}{\sigma_{p,t}}\right)^2\right), \qquad B_{p,t} = Q_{p,t} \times \left( 0.5 \cdot S_t + 0.5 \cdot a_{p,t} \right)"
-        )
-        st.markdown(
-            r"剩餘預算 $1 - B_{p,t}$ 全數配置於當月四等分季度風險調整動能勝出之避險資產 $D_t \in \{\text{GLD}, \text{TLT}\}$。"
-        )
-
-        st.markdown(
-            r"""
-#### 模組 4：`200 / 0 bps` 零殘差成本走廊與單一帳戶匯總執行公式
-令子相位 $p$ 於昨日收盤之實際漂移後持倉權重為 $w^{\text{close}}_{p,t-1}$，今日基礎目標權重為 $w^{\text{base}}_{p,t}$，最大單一資產偏離距離為 $d_{p,t} = \max_k |w^{\text{close}}_{p,t-1,k} - w^{\text{base}}_{p,t,k}|$：
-"""
-        )
-        st.latex(
-            r"w^{\text{plan}}_{p,t} = \begin{cases} w^{\text{base}}_{p,t}, & \text{if Mandatory Override } (\text{Action}=2) \;\text{ or }\; d_{p,t} \ge 0.0200 \quad (\text{Action}=1) \\[8pt] w^{\text{close}}_{p,t-1}, & \text{if } d_{p,t} < 0.0200 \quad (\text{Action}=0) \end{cases}"
-        )
-        st.markdown(
-            r"""
-- **`Action = 2`（強制精確覆蓋）**：當觸發 7 大強制規則（初始建倉、進攻標的 $L_t$ 換股、`SMA6` $S_t$ 翻轉、危機閘門 $Q_{p,t}$ 翻轉、避險資產 $D_t$ 換股、非零持倉集合改變、或**股票預算減碼 $B_{p,t} < B_{p,t-1}$**）時，100% 精確交易至 $w^{\text{base}}_{p,t}$。
-- **`Action = 1`（護欄一步歸位）**：無強制規則但純漂移 $d_{p,t} \ge 200\text{ bps}$ 時，直接一步交易回 $0\text{ bps}$ 偏離之基礎目標權重 $w^{\text{base}}_{p,t}$。
-- **`Action = 0`（免交易抱牢）**：無強制規則且純漂移 $d_{p,t} < 200\text{ bps}$ 時，保留原股數完全不交易。
-
-五個相位各自獨立決定今日開盤計畫權重 $w^{\text{plan}}_{p,t}$ 後，你在**單一券商帳戶**只需執行五相位的算術平均權重：
-"""
-        )
-        st.latex(
-            r"\bar{w}^{\text{plan}}_t = \frac{1}{5} \sum_{p=0}^{4} w^{\text{plan}}_{p,t}"
-        )
-
-        st.subheader("🏛️ 三、 機構鎖定歷史審計基準表 (Locked Institutional Audit Benchmarks)")
         audit_bench_df = pd.DataFrame([
             {
-                "評估環境與時間跨度": "實盤 ETF 歷史期 (2014-01-23 ～ 2026-09-28, 3,189 交易日, 20bps)",
-                "REBAND_HF0_200_0 (本系統)": "CAGR 24.44% ｜ Sharpe 0.684 ｜ Sortino 0.946 ｜ MaxDD -49.05% ｜ 雙邊周轉率 6.30x/年",
-                "SCOPE_HALF_F0 (無護欄)": "CAGR 24.39% ｜ Sharpe 0.683 ｜ Sortino 0.945 ｜ MaxDD -49.05% ｜ 雙邊周轉率 6.60x/年",
-                "原版策略 O": "CAGR 20.31% ｜ Sharpe 0.611 ｜ Sortino 0.829 ｜ MaxDD -50.14% ｜ 雙邊周轉率 8.45x/年",
-                "核心審計結論": "4季統一動能 + SMA6 + 200/0 bps 護欄免交易日高達 96.2% (12.7年僅63次護欄調倉)，且淨報酬超越無護欄版",
+                "無近似審計視窗 (單邊 20 bps)": "純實盤 3x ETF 完整期 (2014-01-23 ～ 2026-11-23, 3,229 日)",
+                "REBAND_QONLY_200_0 (本系統)": "CAGR 24.29% ｜ Sharpe 0.683 ｜ MaxDD -49.05% ｜ 5Y最差 +4.83% ｜ 10Y最差 +19.04% ｜ 周轉 6.26x ｜ 免交易 96.17%",
+                "公平舊版 O_Q4_200_0": "CAGR 16.88% ｜ Sharpe 0.539 ｜ MaxDD -48.49% ｜ 5Y最差 +0.86% ｜ 10Y最差 +13.23% ｜ 周轉 7.43x ｜ 免交易 95.00%",
+                "審計風險提示": "2025 關稅 35 日急跌中兩者皆未觸發 (Crisis Alpha = 0 pp，承擔 -48.67% 跌幅)；實盤應透過總投組倉位上限控管尾部風險。",
             },
             {
-                "評估環境與時間跨度": "超長歷史合成期 (1998-03-02 ～ 2026-09-28, 7,189 交易日, 20bps)",
-                "REBAND_HF0_200_0 (本系統)": "CAGR 25.86% ｜ Sharpe 0.672 ｜ MaxDD -78.53% ｜ 雙邊周轉率 5.91x/年",
-                "SCOPE_HALF_F0 (無護欄)": "CAGR 25.83% ｜ Sharpe 0.672 ｜ MaxDD -78.65% ｜ 雙邊周轉率 6.66x/年",
-                "原版策略 O": "CAGR 23.27% ｜ Sharpe 0.634 ｜ MaxDD -84.16% ｜ 雙邊周轉率 7.97x/年",
-                "核心審計結論": "跨 28.6 年完整牛熊，零自由參數 4 季動能與 200/0 bps 護欄穩健擊敗策略 O 並大幅降低最大回撤",
+                "無近似審計視窗 (單邊 20 bps)": "無金礦股長週期 (2001-09-04 ～ 2026-11-23, 6,343 日, GLD=GC=F)",
+                "REBAND_QONLY_200_0 (本系統)": "CAGR 33.75% ｜ Sharpe 0.803 ｜ MaxDD -77.14% ｜ 5Y最差 +4.98% ｜ 10Y最差 +19.31% ｜ 周轉 5.69x ｜ 免交易 94.77%",
+                "公平舊版 O_Q4_200_0": "CAGR 28.72% ｜ Sharpe 0.733 ｜ MaxDD -78.43% ｜ 5Y最差 +1.28% ｜ 10Y最差 +13.59% ｜ 周轉 6.98x ｜ 免交易 93.75%",
+                "審計風險提示": "歷經多輪測試之歷史回測應強制打折 (Haircut)，並預期未來重演 2008 型百年海嘯時仍可能出現 -70%～-77% 極端回撤。",
             },
-        ]).set_index("評估環境與時間跨度")
+        ]).set_index("無近似審計視窗 (單邊 20 bps)")
         st.dataframe(audit_bench_df, use_container_width=True)
 
     # ==========================================
@@ -1618,7 +1711,6 @@ if not closes_df.empty:
         r_col1, r_col2 = st.columns([3, 2])
         with r_col1:
             st.subheader("📊 當月 1x 原型進攻動能排名表 (SPY / VGK / EEM)")
-            st.caption("採用四等分標準日曆季度 (0~3M, 3~6M, 6~9M, 9~12M) / 252日年化波動率")
             st.dataframe(
                 sel_df.style.format({
                     "Close_1x": "{:.2f}",
@@ -1634,7 +1726,6 @@ if not closes_df.empty:
             )
         with r_col2:
             st.subheader("🛡️ 當月避險資產動能比較表 (GLD vs TLT)")
-            st.caption("同步採用四等分標準日曆季度 (0~3M, 3~6M, 6~9M, 9~12M) / 252日年化波動率")
             st.dataframe(
                 safe_df.style.format({
                     "Close_1x": "{:.2f}",
@@ -1649,15 +1740,29 @@ if not closes_df.empty:
             )
 
         st.subheader("🗓️ 過去 24 個月進攻與防禦標的歷史輪動紀錄")
-        st.dataframe(hist_rot_df.set_index("月底訊號鎖定日"), use_container_width=True)
+        st.dataframe(m_sig["hist_rot_df"].set_index("月底訊號鎖定日"), use_container_width=True)
 
     # ==========================================
-    # 分頁 5：原始報價與系統健康檢查
+    # 分頁 5：原始報價、無近似快取管理與健康檢查
     # ==========================================
     with tab_raw:
-        st.subheader("🗄️ 最新 15 個交易日 ETF 收盤價 (Auto-Adjusted Close)")
-        st.dataframe(closes_df.tail(15).style.format("{:.2f}"), use_container_width=True)
+        st.subheader("🗄️ 最新 15 個已收盤交易日 ETF 復權收盤價 (Auto-Adjusted Close)")
+        st.dataframe(closes_df[CORE_LIVE_ETFS].tail(15).style.format("{:.2f}"), use_container_width=True)
+
+        st.subheader("💾 無近似 Student-t GARCH(1,1) 標準快取檔匯出")
+        if has_full_exact_garch:
+            npz_bytes = serialize_exact_garch_cache(closes_df.index, vol_5ph, garch_fit_pos)
+            st.download_button(
+                label=f"⬇️ 下載最新標準無近似快取檔 ({DEFAULT_GARCH_CACHE_FILE})",
+                data=npz_bytes,
+                file_name=DEFAULT_GARCH_CACHE_FILE,
+                mime="application/octet-stream",
+                help="將此檔提交至您的 GitHub 倉庫根目錄（與主程式同層），Streamlit 啟動即可秒讀 25 年無近似 GARCH 並只增量補算最新交易日。",
+            )
+        else:
+            st.info("目前為近 1.5 年實盤精確模式。請至分頁 2 上傳既有 Colab 快取或點擊全量擬合後，即可在此下載帶日期索引的標準 `.npz` 檔。")
+
         st.caption(
-            f"✅ 資料序列健康度檢查通過：共載入 `{len(closes_df):,}` 個交易日 "
-            f"（起始日 `{closes_df.index[0].strftime('%Y-%m-%d')}`，最新收盤日 `{last_dt_str}` ｜ 資料來源：`{patch_source_note}`）。"
+            f"✅ 資料健康檢查：主軸共 `{len(closes_df):,}` 個交易日（`{closes_df.index[0].strftime('%Y-%m-%d')}` ～ `{last_dt_str}`）｜ "
+            f"資料來源：`{patch_source_note}` ｜ 早期黃金代理：`GC=F`（無 `FSAGX`、無 `.bfill()`）。"
         )
